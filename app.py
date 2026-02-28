@@ -15,8 +15,8 @@ st.title("NLP Embedding 双塔模型")
 
 # Sidebar
 st.sidebar.header("⚙️ 训练参数")
-model_arch = st.sidebar.selectbox("模型架构", ["MeanPooling 极简双塔", "CNN 双塔"], index=0)
-model_type_map = {"MeanPooling 极简双塔": "mean_pooling", "CNN 双塔": "cnn"}
+model_arch = st.sidebar.selectbox("模型架构", ["MeanPooling 极简双塔", "CNN 双塔", "LSTM 双塔"], index=0)
+model_type_map = {"MeanPooling 极简双塔": "mean_pooling", "CNN 双塔": "cnn", "LSTM 双塔": "lstm"}
 selected_model_type = model_type_map[model_arch]
 
 epochs = st.sidebar.slider("Epochs", min_value=1, max_value=50, value=5)
@@ -65,7 +65,7 @@ if start_train:
         status_text = st.empty()
         
         # 计算总 batch 数
-        tok_type = "word" if selected_model_type == "cnn" else "char"
+        tok_type = "word" if selected_model_type in ("cnn", "lstm") else "char"
         mock_dl, mock_tk = get_dataloader("data/lcqmc_2w.csv", batch_size=batch_size, tokenizer_type=tok_type)
         total_batches = len(mock_dl)
         total_steps = epochs * total_batches

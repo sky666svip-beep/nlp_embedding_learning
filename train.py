@@ -5,8 +5,8 @@ from model import get_model
 
 def train_model(data_path, epochs=10, batch_size=16, lr=1e-3, embed_dim=128, model_type="mean_pooling", callback=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
-    # CNN 使用词级分词以捕获有意义的 N-gram，MeanPooling 使用字符级
-    tok_type = "word" if model_type == "cnn" else "char"
+    # CNN/LSTM 使用词级分词以捕获有意义的语义单元，MeanPooling 使用字符级
+    tok_type = "word" if model_type in ("cnn", "lstm") else "char"
     print(f"Using device: {device} | Model: {model_type} | Tokenizer: {tok_type}")
     
     dataloader, tokenizer = get_dataloader(data_path, batch_size, tokenizer_type=tok_type)
@@ -31,6 +31,9 @@ def train_model(data_path, epochs=10, batch_size=16, lr=1e-3, embed_dim=128, mod
             
             loss = criterion(sim, target_sim)
             loss.backward()
+            # LSTM 梯度沿时间步反传容易爆炸，裁剪梯度范数防止高学习率下 NaN
+            if model_type == "lstm":
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
             # Calculate accuracy: positive sim for positive label, negative sim for negative label

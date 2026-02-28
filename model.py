@@ -62,10 +62,48 @@ class CNNDualEncoder(nn.Module):
         return sim, vec1, vec2
 
 
+class LSTMDualEncoder(nn.Module):
+    """LSTM 双塔：Embedding + LayerNorm + 2层双向LSTM + Dropout + 投影层"""
+    def __init__(self, vocab_size, embed_dim=128, hidden_dim=128, num_layers=2):
+        super().__init__()
+        self.embedding = nn.Embedding(num_embeddings=vocab_size, embedding_dim=embed_dim, padding_idx=0)
+        # LayerNorm 稳定 Embedding 输出，缓解大词表稀疏梯度问题
+        self.layer_norm = nn.LayerNorm(embed_dim)
+        # 2 层双向 LSTM：捕获长距离前后文依赖
+        self.lstm = nn.LSTM(
+            input_size=embed_dim, hidden_size=hidden_dim,
+            num_layers=num_layers, batch_first=True,
+            bidirectional=True, dropout=0.3 if num_layers > 1 else 0
+        )
+        self.dropout = nn.Dropout(0.3)
+        # 双向输出是 2*hidden_dim，投影回 embed_dim
+        self.projection = nn.Linear(hidden_dim * 2, embed_dim)
+
+    def encode_single(self, seq):
+        """将单个序列编码为句子向量"""
+        lengths = (seq != 0).sum(dim=1).clamp(min=1)
+        emb = self.embedding(seq)                            # (batch, seq_len, embed_dim)
+        emb = self.layer_norm(emb)                           # 归一化嵌入
+        output, _ = self.lstm(emb)                           # (batch, seq_len, hidden_dim*2)
+        # 利用实际长度做平均池化，忽略 PAD 位置
+        mask = (seq != 0).unsqueeze(-1).float()
+        vec = (output * mask).sum(dim=1) / lengths.unsqueeze(-1).float()
+        vec = self.dropout(vec)
+        vec = self.projection(vec)                           # (batch, embed_dim)
+        return vec
+
+    def forward(self, seq1, seq2):
+        vec1 = self.encode_single(seq1)
+        vec2 = self.encode_single(seq2)
+        sim = F.cosine_similarity(vec1, vec2, dim=-1)
+        return sim, vec1, vec2
+
+
 # 工厂函数：根据名称创建对应模型
 MODEL_REGISTRY = {
     "mean_pooling": SimpleDualEncoder,
     "cnn": CNNDualEncoder,
+    "lstm": LSTMDualEncoder,
 }
 
 def get_model(model_type, vocab_size, embed_dim=128):

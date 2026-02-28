@@ -1,5 +1,6 @@
 /data
 /implementation_plan.md.metadata.json
 /__pycache__
-/.agent
+.agents/
 /output
+# git push origin main

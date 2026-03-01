@@ -98,14 +98,14 @@ def get_dataloader(csv_path, batch_size=16, tokenizer=None, max_len=32, tokenize
     
     if not tokenizer:
         if os.path.exists(dataset_cache_path) and os.path.exists(tokenizer_cache_path):
-            print(f"👉 命中本地缓存: {cache_key}，正在极速加载序列化数据集...")
+            print(f"[缓存] 命中本地缓存: {cache_key}，正在极速加载序列化数据集...")
             with open(tokenizer_cache_path, "rb") as f:
                 tokenizer = pickle.load(f)
             with open(dataset_cache_path, "rb") as f:
                 dataset = pickle.load(f)
             return DataLoader(dataset, batch_size=batch_size, shuffle=True), tokenizer
 
-        print(f"⏳ 未命中本地缓存: 正在全量分词与张量化 {csv_path} (请耐心等待)...")
+        print(f"[处理] 未命中本地缓存: 正在全量分词与张量化 {csv_path} (请耐心等待)...")
         df = pd.read_csv(csv_path)
         
         if tokenizer_type == "word":
@@ -127,7 +127,7 @@ def get_dataloader(csv_path, batch_size=16, tokenizer=None, max_len=32, tokenize
         with open(dataset_cache_path, "wb") as f:
             pickle.dump(dataset, f)
             
-        print(f"✅ 生成静态缓存完成: {cache_key}")
+        print(f"[成功] 生成静态缓存完成: {cache_key}")
     else:
         # 如果从外部传入了已训练好的 tokenizer（例如预测时），则直连不缓存
         df = pd.read_csv(csv_path)

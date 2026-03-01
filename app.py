@@ -16,7 +16,7 @@ st.set_page_config(page_title="NLP Embedding 学习", layout="wide")
 st.title("NLP Embedding 双塔模型")
 
 # Sidebar
-st.sidebar.header("⚙️ 训练参数")
+st.sidebar.header("[训练参数]")
 model_arch = st.sidebar.selectbox("模型架构", ["MeanPooling 极简双塔", "CNN 双塔", "LSTM 双塔"], index=0)
 model_type_map = {"MeanPooling 极简双塔": "mean_pooling", "CNN 双塔": "cnn", "LSTM 双塔": "lstm"}
 selected_model_type = model_type_map[model_arch]
@@ -24,18 +24,18 @@ selected_model_type = model_type_map[model_arch]
 dataset_scale = st.sidebar.selectbox("训练数据规模", [
     "全量集 (lcqmc_max, 约24w条)", 
     "中型集 (lcqmc_2w, 约2w条)", 
-    "迷你集 (lcqmc_mini, 60条)"
+    "迷你集 (lcqmc_mini, 5k条)"
 ], index=0)
 
 dataset_map = {
     "全量集 (lcqmc_max, 约24w条)": "data/lcqmc_max.csv",
     "中型集 (lcqmc_2w, 约2w条)": "data/lcqmc_2w.csv",
-    "迷你集 (lcqmc_mini, 60条)": "data/lcqmc_mini.csv"
+    "迷你集 (lcqmc_mini, 5k条)": "data/lcqmc_mini.csv"
 }
 selected_dataset_path = dataset_map[dataset_scale]
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("💡 推荐参数设置")
+st.sidebar.subheader("[推荐参数设置]")
 if "max" in selected_dataset_path:
     st.sidebar.info("大语料建议：Epochs: 1-3 | LR: 0.0005 | Batch Size: 128或256")
     default_epochs, default_lr, default_batch = 2, 0.0005, 3
@@ -65,14 +65,14 @@ if "acc_history" not in st.session_state:
 if "train_version" not in st.session_state:
     st.session_state.train_version = 0
 
-tab1, tab2, tab3, tab4 = st.tabs(["📊 1. 训练与评估监控", "🌌 2. 空间特征降维", "🤖 3. 模型预测", "🔍 4. 向量检索与应用"])
+tab1, tab2, tab3, tab4 = st.tabs(["1. 训练与评估监控", "2. 空间特征降维", "3. 模型预测", "4. 向量检索与应用"])
 
 with st.sidebar:
-    start_train = st.button("🚀 开始训练", use_container_width=True)
+    start_train = st.button("开始训练", use_container_width=True)
     
     st.divider()
     if st.session_state.model_state is not None:
-        if st.button("💾 保存模型到本地", use_container_width=True):
+        if st.button("保存模型到本地", use_container_width=True):
             os.makedirs("output", exist_ok=True)
             # Save weights
             torch.save(st.session_state.model_state, "output/model_weights.pth")
@@ -115,33 +115,33 @@ if start_train:
         # 训练结束后一次性渲染最终曲线
         col_c1, col_c2 = st.columns(2)
         with col_c1:
-            st.write("📉 **Loss 曲线**")
+            st.write("[Loss 曲线]")
             st.line_chart(st.session_state.loss_history)
         with col_c2:
-            st.write("🎯 **Accuracy 曲线**")
+            st.write("[Accuracy 曲线]")
             st.line_chart(st.session_state.acc_history)
-        st.success(f"🎉 训练完成（{model_arch}）！请前往其他 Tab 查看效果。")
+        st.success(f"训练完成（{model_arch}）！请前往其他 Tab 查看效果。")
 else:
     with tab1:
         st.subheader("模型训练与收敛状态")
         col_c1, col_c2 = st.columns(2)
         with col_c1:
-            st.write("📉 **Loss (均方误差) 曲线**")
+            st.write("[Loss (均方误差) 曲线]")
             if st.session_state.loss_history:
                 st.line_chart(st.session_state.loss_history)
             else:
-                st.info("👈 等待数据。")
+                st.info("等待数据。")
         with col_c2:
-            st.write("🎯 **Accuracy (批次准确率) 曲线**")
+            st.write("[Accuracy (批次准确率) 曲线]")
             if st.session_state.acc_history:
                 st.line_chart(st.session_state.acc_history)
             else:
-                st.info("👈 等待数据。")
+                st.info("等待数据。")
         
         if st.session_state.loss_history:
-            st.success("🎉 这是当前存留的模型训练走势。")
+            st.success("这是当前存留的模型训练走势。")
         else:
-            st.info("👈 请先在侧边栏点击【开始训练】。")
+            st.info("请先在侧边栏点击【开始训练】。")
 
 @st.cache_resource
 def get_cached_model(model_type, model_state_bytes, _tokenizer):
@@ -200,7 +200,7 @@ def compute_similarity_distribution(version, _model, _tokenizer, dataset_path):
 
 with tab1:
     st.divider()
-    st.subheader("🔬 全局预测分布透视图 (相似度分布直方图)")
+    st.subheader("[全局预测分布透视图] (相似度分布直方图)")
     if st.session_state.model_state:
         mod, tk = get_loaded_model()
         
@@ -215,7 +215,7 @@ with tab1:
             ax.set_ylabel('Frequency')
             ax.legend(loc='upper right')
             st.pyplot(fig)
-            st.markdown("💡 **怎么看这张图？** 绿色直方图越靠右 (趋近 1)，红色直方图越靠左 (趋近 -1)，重叠部分越少，说明模型“区分句子相似与否的能力”越强（两极分化越好）！")
+            st.markdown("**怎么看这张图？** 绿色直方图越靠右 (趋近 1)，红色直方图越靠左 (趋近 -1)，重叠部分越少，说明模型“区分句子相似与否的能力”越强（两极分化越好）！")
     else:
         st.info("尚未完成训练，无法查看分布直方图。")
 
@@ -251,9 +251,9 @@ with tab2:
                 st.scatter_chart(chart_df, x="X", y="Y")
             with c2:
                 st.dataframe(chart_df[["X", "Y", "Text"]], use_container_width=True)
-                st.caption("👈 左侧图表为点位分布，对照此表可查找具体句子所在坐标。")
+                st.caption("左侧图表为点位分布，对照此表可查找具体句子所在坐标。")
     else:
-        st.info("👈 请先在侧边栏点击【开始训练】。")
+        st.info("请先在侧边栏点击【开始训练】。")
 
 with tab3:
     st.subheader("输入两句话，预测相似度指数")
@@ -263,7 +263,7 @@ with tab3:
     s1 = col1.text_input("第一句话", "苹果手机怎么截图")
     s2 = col2.text_input("第二句话", "iPhone屏显怎么截")
         
-    if st.button("⚡ 计算相似度", type="primary"):
+    if st.button("计算相似度", type="primary"):
         if mod:
             mod = mod.to(device)
             id1 = torch.tensor([tk.encode(s1, max_len=32)], dtype=torch.long).to(device)
@@ -273,11 +273,11 @@ with tab3:
             
             st.metric(label="Cosine Similarity (余弦相似度)", value=f"{similarity_score:.4f}")
             if similarity_score > 0.5:
-                st.success("💡 判断：它们大概率是 **相似** 的！")
+                st.success("判断：它们大概率是 **相似** 的！")
             else:
-                st.warning("⏳ 判断：它们可能 **不相似**。")
+                st.warning("判断：它们可能 **不相似**。")
         else:
-            st.error("⚠️ 模型未初始化，请先训练！")
+            st.error("出错： 模型未初始化，请先训练！")
 
 with tab4:
     st.subheader("构建本地微型向量库与加速检索体验")
@@ -285,15 +285,15 @@ with tab4:
     
     col_v1, col_v2 = st.columns([1, 2])
     with col_v1:
-        st.info("💡 必须先训练或加载模型，才能将其能力用于构建向量库。")
-        build_db_btn = st.button("🚀 根据当前语料库构建全量向量索引", type="primary", use_container_width=True)
+        st.info("提示：必须先训练或加载模型，才能将其能力用于构建向量库。")
+        build_db_btn = st.button("根据当前语料库构建全量向量索引", type="primary", use_container_width=True)
     
     if "vector_db" not in st.session_state:
         st.session_state.vector_db = None
     
     if build_db_btn:
         if not st.session_state.model_state:
-            st.error("⚠️ 当前无可用模型！请先在侧拉栏点击【开始训练】。")
+            st.error("出错： 当前无可用模型！请先在侧拉栏点击【开始训练】。")
         else:
             mod, tk = get_loaded_model()
             mod = mod.to(device)
@@ -329,7 +329,7 @@ with tab4:
                 # 使用内积 (Inner Product) 索引评估，因为标准化后内积 == 余弦相似度
                 faiss_index = faiss.IndexFlatIP(embed_dim) 
                 faiss_index.add(np_embeddings)
-                
+
             # 保存到 session
             st.session_state.vector_db = {
                 "tensor": full_tensor.to(device), # 暴力矩阵搜索用
@@ -337,11 +337,11 @@ with tab4:
                 "texts": sentences,
                 "labels": labels
             }
-            st.success(f"🎉 成功构建向量库！一共编入 {len(sentences)} 根不重复向量。")
+            st.success(f"成功构建向量库！一共编入 {len(sentences)} 根不重复向量。")
 
     if st.session_state.vector_db:
         st.divider()
-        st.markdown("### 🔍 开始语义检索寻找相似语句")
+        st.markdown("### 开始语义检索寻找相似语句")
         
         c_q1, c_q2 = st.columns([3, 1])
         with c_q1:
@@ -357,9 +357,9 @@ with tab4:
             with torch.no_grad():
                 q_emb = mod.encode_single(id_query)
                 q_emb = torch.nn.functional.normalize(q_emb, p=2, dim=1)
-                
-            db = st.session_state.vector_db
             
+            db = st.session_state.vector_db
+                
             # 轨 1: PyTorch 纯矩阵暴力点乘算分
             pt_start = time.time()
             # q_emb [1, D], db['tensor'] [N, D] -> 分数 [1, N]
@@ -374,15 +374,17 @@ with tab4:
             f_scores, f_indices = db['faiss'].search(np_q, top_k)
             faiss_end = time.time()
             faiss_time_ms = (faiss_end - faiss_start) * 1000
+            st.markdown(f"**检索性能对比:** `PyTorch:` **{pt_time_ms:.2f} 毫秒** vs `FAISS:` **{faiss_time_ms:.2f} 毫秒**")
             
-            st.markdown(f"**⚡ 检索性能对比:** `PyTorch:` **{pt_time_ms:.2f} 毫秒** vs  `FAISS:` **{faiss_time_ms:.2f} 毫秒**")
             # 通过大语料 (lcqmc_max 24w 去重后大概 38 万 unique 句子)，可观察到两者巨大差异
             
             # 组装召回结果为直观表格
             results = []
-            f_idx_list = f_indices[0]
-            f_score_list = f_scores[0]
-            for r_i, (idx, score) in enumerate(zip(f_idx_list, f_score_list)):
+            
+            idx_list = f_indices[0]
+            score_list = f_scores[0]
+                
+            for r_i, (idx, score) in enumerate(zip(idx_list, score_list)):
                 results.append({
                     "排名 (Rank)": r_i + 1,
                     "召回的句子 (Sentence)": db['texts'][idx],

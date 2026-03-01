@@ -19,9 +19,34 @@ model_arch = st.sidebar.selectbox("模型架构", ["MeanPooling 极简双塔", "
 model_type_map = {"MeanPooling 极简双塔": "mean_pooling", "CNN 双塔": "cnn", "LSTM 双塔": "lstm"}
 selected_model_type = model_type_map[model_arch]
 
-epochs = st.sidebar.slider("Epochs", min_value=1, max_value=50, value=5)
-lr = st.sidebar.number_input("Learning Rate", value=0.001, format="%.4f")
-batch_size = st.sidebar.selectbox("Batch Size", [16, 32, 64, 128], index=2)
+dataset_scale = st.sidebar.selectbox("训练数据规模", [
+    "全量集 (lcqmc_max, 约24w条)", 
+    "中型集 (lcqmc_2w, 约2w条)", 
+    "迷你集 (lcqmc_mini, 60条)"
+], index=0)
+
+dataset_map = {
+    "全量集 (lcqmc_max, 约24w条)": "data/lcqmc_max.csv",
+    "中型集 (lcqmc_2w, 约2w条)": "data/lcqmc_2w.csv",
+    "迷你集 (lcqmc_mini, 60条)": "data/lcqmc_mini.csv"
+}
+selected_dataset_path = dataset_map[dataset_scale]
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("💡 推荐参数设置")
+if "max" in selected_dataset_path:
+    st.sidebar.info("大语料建议：Epochs: 1-3 | LR: 0.0005 | Batch Size: 128或256")
+    default_epochs, default_lr, default_batch = 2, 0.0005, 3
+elif "2w" in selected_dataset_path:
+    st.sidebar.info("中语料建议：Epochs: 5-10 | LR: 0.001 | Batch Size: 64")
+    default_epochs, default_lr, default_batch = 5, 0.001, 2
+else:
+    st.sidebar.info("微语料建议：Epochs: 15-30 | LR: 0.005 | Batch Size: 16")
+    default_epochs, default_lr, default_batch = 15, 0.005, 0
+
+epochs = st.sidebar.slider("Epochs", min_value=1, max_value=50, value=default_epochs)
+lr = st.sidebar.number_input("Learning Rate", value=default_lr, format="%.4f")
+batch_size = st.sidebar.selectbox("Batch Size", [16, 32, 64, 128, 256], index=default_batch)
 embed_dim = st.sidebar.slider("词向量维度", min_value=8, max_value=256, value=128)
 
 if "model_state" not in st.session_state:
@@ -66,7 +91,7 @@ if start_train:
         
         # 计算总 batch 数
         tok_type = "word" if selected_model_type in ("cnn", "lstm") else "char"
-        mock_dl, mock_tk = get_dataloader("data/lcqmc_2w.csv", batch_size=batch_size, tokenizer_type=tok_type)
+        mock_dl, mock_tk = get_dataloader(selected_dataset_path, batch_size=batch_size, tokenizer_type=tok_type)
         total_batches = len(mock_dl)
         total_steps = epochs * total_batches
         
@@ -80,7 +105,7 @@ if start_train:
                 status_text.text(f"Epoch {epoch+1}/{epochs} 完成 | 平均Loss: {loss:.4f} | 末尾Acc: {batch_acc:.4f}")
             
         with st.spinner(f"模型 ({model_arch}) 正在学习语义分布中..."):
-            model, tokenizer = train_model("data/lcqmc_2w.csv", epochs, batch_size, lr, embed_dim, model_type=selected_model_type, callback=train_callback)
+            model, tokenizer = train_model(selected_dataset_path, epochs, batch_size, lr, embed_dim, model_type=selected_model_type, callback=train_callback)
             st.session_state.model_state = model.state_dict()
             st.session_state.tokenizer = tokenizer
             st.session_state.model_type = selected_model_type
@@ -143,9 +168,9 @@ def get_loaded_model():
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 
 @st.cache_data
-def compute_similarity_distribution(version, _model, _tokenizer):
-    """计算 2w 数据集的全局相似度分布，通过 version 参数控制刷新"""
-    df = pd.read_csv("data/lcqmc_2w.csv")
+def compute_similarity_distribution(version, _model, _tokenizer, dataset_path):
+    """计算数据集的全局相似度分布，通过 version 参数控制刷新"""
+    df = pd.read_csv(dataset_path)
     mod = _model.to(device)
     pos_sims, neg_sims = [], []
     
@@ -178,7 +203,7 @@ with tab1:
         mod, tk = get_loaded_model()
         
         with st.spinner("计算全局相似度分布 (已利用 GPU 批处理提速 & 数据缓存)..."):
-            pos_sims, neg_sims = compute_similarity_distribution(st.session_state.train_version, mod, tk)
+            pos_sims, neg_sims = compute_similarity_distribution(st.session_state.train_version, mod, tk, selected_dataset_path)
             
             fig, ax = plt.subplots(figsize=(8, 3))
             ax.hist(pos_sims, bins=np.linspace(-1, 1, 21), alpha=0.6, label='Similar (Label=1)', color='green')
@@ -210,7 +235,7 @@ with tab2:
     st.markdown("将高维的句子向量压缩至2D平面，距离相近的点代表模型认为它们语义相似。")
     if st.session_state.model_state:
         mod, tk = get_loaded_model()
-        df = pd.read_csv("data/lcqmc_2w.csv")
+        df = pd.read_csv(selected_dataset_path)
         # 提取前 30 对句子用于展示
         sentences = list(set(df['sentence1'].tolist()[:30] + df['sentence2'].tolist()[:30]))
         

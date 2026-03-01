@@ -9,6 +9,8 @@ import torch
 import os
 import pickle
 import matplotlib.pyplot as plt
+import time
+import faiss
 
 st.set_page_config(page_title="NLP Embedding 学习", layout="wide")
 st.title("NLP Embedding 双塔模型")
@@ -63,7 +65,7 @@ if "acc_history" not in st.session_state:
 if "train_version" not in st.session_state:
     st.session_state.train_version = 0
 
-tab1, tab2, tab3 = st.tabs(["📊 1. 训练与评估监控", "🌌 2. 空间特征降维", "🤖 3. 模型预测"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 1. 训练与评估监控", "🌌 2. 空间特征降维", "🤖 3. 模型预测", "🔍 4. 向量检索与应用"])
 
 with st.sidebar:
     start_train = st.button("🚀 开始训练", use_container_width=True)
@@ -276,3 +278,117 @@ with tab3:
                 st.warning("⏳ 判断：它们可能 **不相似**。")
         else:
             st.error("⚠️ 模型未初始化，请先训练！")
+
+with tab4:
+    st.subheader("构建本地微型向量库与加速检索体验")
+    st.markdown("将全量数据集的句子映射成特征向量存入“向量库”，体验通过一句话瞬间找回最相似的 Top-K 条语料。通过对比普通「PyTorch 暴力矩阵算分」与大厂使用的「FAISS 近似检索引擎」，直观感受性能差异。")
+    
+    col_v1, col_v2 = st.columns([1, 2])
+    with col_v1:
+        st.info("💡 必须先训练或加载模型，才能将其能力用于构建向量库。")
+        build_db_btn = st.button("🚀 根据当前语料库构建全量向量索引", type="primary", use_container_width=True)
+    
+    if "vector_db" not in st.session_state:
+        st.session_state.vector_db = None
+    
+    if build_db_btn:
+        if not st.session_state.model_state:
+            st.error("⚠️ 当前无可用模型！请先在侧拉栏点击【开始训练】。")
+        else:
+            mod, tk = get_loaded_model()
+            mod = mod.to(device)
+            df = pd.read_csv(selected_dataset_path)
+            
+            with st.spinner("1/3 正在提取唯一句子字典 (过滤重复语句)..."):
+                # 为了防止两两配对数据里大量重复句子占用显存，首先去重
+                s1_unique = df[['sentence1', 'label']].rename(columns={'sentence1': 'text'})
+                s2_unique = df[['sentence2', 'label']].rename(columns={'sentence2': 'text'})
+                # 由于相同的句子如果在原表中遇到过正样本又遇到负样本，保留第一次出现的，仅作为检索结果参考
+                unique_df = pd.concat([s1_unique, s2_unique]).drop_duplicates(subset=['text'], keep='first').reset_index(drop=True)
+                sentences = unique_df['text'].tolist()
+                labels = unique_df['label'].tolist()
+            
+            with st.spinner(f"2/3 正在使用 GPU 将 {len(sentences)} 条语句编码为高维特征 (可能耗时数十秒)..."):
+                all_embeddings = []
+                batch_size = 256
+                # 此处也应用批量处理加速
+                for i in range(0, len(sentences), batch_size):
+                    batch_texts = sentences[i:i+batch_size]
+                    # Tokenize
+                    ids = [torch.tensor(tk.encode(s, max_len=32)) for s in batch_texts]
+                    input_tensors = torch.stack(ids).to(device)
+                    with torch.no_grad():
+                        embs = mod.encode_single(input_tensors)
+                        embs = torch.nn.functional.normalize(embs, p=2, dim=1) # 必须 L2 标准化以计算余弦/内积
+                    all_embeddings.append(embs.cpu())
+                    
+                full_tensor = torch.cat(all_embeddings, dim=0) # [N, embed_dim]
+                
+            with st.spinner("3/3 正在构建 FAISS 倒排索引..."):
+                np_embeddings = full_tensor.numpy().astype('float32') # FAISS 强依赖 float32 numpy 格式
+                # 使用内积 (Inner Product) 索引评估，因为标准化后内积 == 余弦相似度
+                faiss_index = faiss.IndexFlatIP(embed_dim) 
+                faiss_index.add(np_embeddings)
+                
+            # 保存到 session
+            st.session_state.vector_db = {
+                "tensor": full_tensor.to(device), # 暴力矩阵搜索用
+                "faiss": faiss_index,             # FAISS 查表搜索用
+                "texts": sentences,
+                "labels": labels
+            }
+            st.success(f"🎉 成功构建向量库！一共编入 {len(sentences)} 根不重复向量。")
+
+    if st.session_state.vector_db:
+        st.divider()
+        st.markdown("### 🔍 开始语义检索寻找相似语句")
+        
+        c_q1, c_q2 = st.columns([3, 1])
+        with c_q1:
+            query = st.text_input("请输入想要寻找相似句子的检索语句 (Query):", "北京天气咋样")
+        with c_q2:
+            top_k = st.slider("想要召回的数量 (Top-K):", min_value=1, max_value=50, value=10)
+            
+        if st.button("开始双轨平行检索", use_container_width=True):
+            mod, tk = get_loaded_model()
+            mod = mod.to(device)
+            # 1. 编码用户的查询语句
+            id_query = torch.tensor([tk.encode(query, max_len=32)], dtype=torch.long).to(device)
+            with torch.no_grad():
+                q_emb = mod.encode_single(id_query)
+                q_emb = torch.nn.functional.normalize(q_emb, p=2, dim=1)
+                
+            db = st.session_state.vector_db
+            
+            # 轨 1: PyTorch 纯矩阵暴力点乘算分
+            pt_start = time.time()
+            # q_emb [1, D], db['tensor'] [N, D] -> 分数 [1, N]
+            all_scores = torch.matmul(q_emb, db['tensor'].t()) 
+            top_scores, top_indices = torch.topk(all_scores, k=top_k, dim=1)
+            pt_end = time.time()
+            pt_time_ms = (pt_end - pt_start) * 1000
+            
+            # 轨 2: FAISS 高速相似度查表算分
+            np_q = q_emb.cpu().numpy().astype('float32')
+            faiss_start = time.time()
+            f_scores, f_indices = db['faiss'].search(np_q, top_k)
+            faiss_end = time.time()
+            faiss_time_ms = (faiss_end - faiss_start) * 1000
+            
+            st.markdown(f"**⚡ 检索性能对比:** `PyTorch:` **{pt_time_ms:.2f} 毫秒** vs  `FAISS:` **{faiss_time_ms:.2f} 毫秒**")
+            # 通过大语料 (lcqmc_max 24w 去重后大概 38 万 unique 句子)，可观察到两者巨大差异
+            
+            # 组装召回结果为直观表格
+            results = []
+            f_idx_list = f_indices[0]
+            f_score_list = f_scores[0]
+            for r_i, (idx, score) in enumerate(zip(f_idx_list, f_score_list)):
+                results.append({
+                    "排名 (Rank)": r_i + 1,
+                    "召回的句子 (Sentence)": db['texts'][idx],
+                    "余弦相似度": f"{score:.4f}",
+                    "原始语境判定(Label)": "由于环境关联 (1)" if db['labels'][idx] == 1 else "环境无关 (0)"
+                })
+                
+            st.dataframe(pd.DataFrame(results), use_container_width=True)
+

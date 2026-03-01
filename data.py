@@ -1,3 +1,6 @@
+import hashlib
+import os
+import pickle
 import re
 import jieba
 import pandas as pd
@@ -78,14 +81,56 @@ class STSDataset(Dataset):
         return id1, id2, label
 
 def get_dataloader(csv_path, batch_size=16, tokenizer=None, max_len=32, tokenizer_type="char"):
-    """tokenizer_type: 'char' (字符级) 或 'word' (词级，jieba)"""
-    df = pd.read_csv(csv_path)
+    """tokenizer_type: 'char' (字符级) 或 'word' (词级，jieba)
+    加入本地离线缓存机制，实现大文件的秒级序列化加载。
+    """
+    # 建立缓存标识
+    cache_dir = "data/cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    file_stat = os.stat(csv_path)
+    # 基于路径、修改时间、分词类型组合哈希
+    hash_str = f"{csv_path}_{file_stat.st_mtime}_{tokenizer_type}_{max_len}"
+    cache_key = hashlib.md5(hash_str.encode()).hexdigest()
+    
+    dataset_cache_path = os.path.join(cache_dir, f"dataset_{cache_key}.pkl")
+    tokenizer_cache_path = os.path.join(cache_dir, f"tokenizer_{cache_key}.pkl")
+    
     if not tokenizer:
+        if os.path.exists(dataset_cache_path) and os.path.exists(tokenizer_cache_path):
+            print(f"👉 命中本地缓存: {cache_key}，正在极速加载序列化数据集...")
+            with open(tokenizer_cache_path, "rb") as f:
+                tokenizer = pickle.load(f)
+            with open(dataset_cache_path, "rb") as f:
+                dataset = pickle.load(f)
+            return DataLoader(dataset, batch_size=batch_size, shuffle=True), tokenizer
+
+        print(f"⏳ 未命中本地缓存: 正在全量分词与张量化 {csv_path} (请耐心等待)...")
+        df = pd.read_csv(csv_path)
+        
         if tokenizer_type == "word":
             tokenizer = SimpleWordTokenizer()
             max_len = 20  # 词级分词后序列更短
         else:
             tokenizer = SimpleCharTokenizer()
-        tokenizer.fit(df['sentence1'].tolist() + df['sentence2'].tolist())
-    dataset = STSDataset(df, tokenizer, max_len)
+        
+        # 提取语料训练分词器
+        texts = df['sentence1'].tolist() + df['sentence2'].tolist()
+        tokenizer.fit(texts)
+        
+        # 实例化 Dataset（会在内部进行 encode）
+        dataset = STSDataset(df, tokenizer, max_len)
+        
+        # 落盘缓存
+        with open(tokenizer_cache_path, "wb") as f:
+            pickle.dump(tokenizer, f)
+        with open(dataset_cache_path, "wb") as f:
+            pickle.dump(dataset, f)
+            
+        print(f"✅ 生成静态缓存完成: {cache_key}")
+    else:
+        # 如果从外部传入了已训练好的 tokenizer（例如预测时），则直连不缓存
+        df = pd.read_csv(csv_path)
+        dataset = STSDataset(df, tokenizer, max_len)
+
     return DataLoader(dataset, batch_size=batch_size, shuffle=True), tokenizer

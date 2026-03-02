@@ -54,6 +54,18 @@
 - [ ] 新增 `Tab 4: 向量检索与应用`，由用户显式按钮触发展开。
 - [ ] 实现交互 UI：输入 Query，返回最相似 top-k 的句子、距离打分以及原始业务 Label 以供对比验证。
 
+### 阶段九：推理与训练流程统一封装 (Complete)
+
+- [x] 抽象抽取核心推理想法：不再在UI `app.py` 中散落 PyTorch 张量操作与模型分词编码逻辑。
+- [x] 建立 `engine.py` (`DualEncoderEngine` 面向对象类)，对上层提供统一的 `.train()`, `.encode()`, `.predict_similarity()` 极简接口。
+- [x] 重构前端逻辑对接 Engine，保障未来不论添加什么新“塔” (Transformer 等) 都能直接免驱热复用。
+
+### 阶段十：Transformer 基础架构引申 (Complete)
+
+- [x] 设计 `TransformerDualEncoder`，利用 `nn.TransformerEncoderLayer` 构建多头自注意力堆叠结构。
+- [x] 附加绝对位置编码 `position_embedding` 与 `LayerNorm` 等级稳定。
+- [x] 加入 `app.py` 中的前端控制台选项与自动超参，并顺利对接通用 `engine.py` 的管线运行跑通。
+
 ## 决策记录
 
 | 决策             | 原因                                                                                         | 状态   |

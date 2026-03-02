@@ -57,22 +57,42 @@
 - **余弦空间的表示坍塌 (Representation Collapse)**：我们曾试着在最后一层使用 `tanh` 激活函数以匹配余弦函数 [-1, 1] 的特性。灾难发生了：不论什么句子输入，输出永远几乎一样！原来是高学习率将激活值全部推向了 `tanh` 两侧极端（都近似于1或-1），导致特征多样性全盘丢失，直方图上的绿柱（相似）与红柱（不相似）完全合体。移除 `tanh` 恢复**线性投射**后，特征的多向性得以释放。
 - **终极演进：Attention Pooling (注意力加权池化)**：简单地对句子所有的词粗暴取平均对于时序模型而言十分浪费。我们手写并引入了基于 Softmax 的打分注意网络。它能聪明地明白类似“苹果”或“截图”这样的核心词汇应该赋予更大的池化权重，而虚词则被过滤。这也帮助 LSTM 拿下了所有架构中的最优抗拉扯表现！
 
-### 9. 大数据支撑与 UI 性能优化 (Performance & Scaling)
+### 9. Transformer 基础双塔 (Transformer Dual Encoder)
+
+为了向更前沿的预训练大模型 (如 BERT/RoBERTa) 演进做准备，我们在不使用任何海量预训练权重的前提下，直接手搭并硬训了一个纯粹的 Transformer 基础塔：
+
+- **自注意力机制 (Self-Attention)**：抛除了 CNN 的局部窗口和 RNN 的时序步进局限，使用 `nn.TransformerEncoderLayer` 构建了具有多头自注意力 (Multi-Head Attention) 的深层理解网络，赋予了每个词直接观照全句的上帝视角。
+- **绝对位置编码 (Absolute Positional Embedding)**：由于 Transformer 天生对词汇顺序是“瞎子”，我们显式地为输入注入了一层可联合训练的位置表征 (Position Embedding)。
+- **深坑挑战 - 表示表示坍塌 (Representation Collapse)**：在从零训练 Transformer 时，我们发现模型陷入了局部最优死锁，所有句子算出来的余弦相似度极度拥挤在 `1.0` 附近。我们通过以下工业级调优手段完美破解了坍塌：
+  1. **开启 Pre-LayerNorm (`norm_first=True`)**：原生的 Post-LN (残差外归一化) 极易导致训练初期梯度爆炸与消失，必须改为残差内归一化。
+  2. **收紧初始化方差**：为底层随机状态的 `nn.Embedding` 应用了标准差仅为 0.02 的正态分布，避免初始映射过于发散。
+  3. **废除均值池化 (Mean Pooling)**：引入类似于 LSTM 中使用的加权自注意力池化网络 (`Self-Attention Pooling`)，强迫模型提取核心关键词素，彻底撕开了余弦相似/不相似空间的壁垒！
+
+### 10. 大数据支撑与 UI 性能优化 (Performance & Scaling)
 
 当我们将训练语料从 60 条 (`lcqmc_mini.csv`) 猛增至 20,000 条 (`lcqmc_2w.csv`) 时，极简架构成功顶住了压力，但交互端面临了巨大挑战。我们通过以下手段实现了秒级响应：
 
 - **Streamlit 渲染节流**：放弃每 batch 刷新图表的方案，改为每 50 步或每 Epoch 结束时才向浏览器推送图表更新，彻底避免了 WebSocket 过载断连问题。
 - **数据与组件缓存**：利用 `@st.cache_resource` 缓存 PyTorch 模型的实例化与加载，并用 `@st.cache_data` 缓存 PCA 降维结果，防止页面切换时触发极其昂贵的重绘。
 - **GPU 批量推理加速**：直方图所需的两万条数据的全局检验，从原先 `df.iterrows()` 逐行低效推理修改为了基于 `batch_size=256` 的 DataLoader 式张量批处理，配合 `torch.no_grad()` 将全量检验时间从几分钟缩短至 1 秒以内。这不仅带来了极速体验，更一举修复了由此阻塞造成的“相似度计算按钮点击无反应”恶性 Bug。
+- **混合向量检索库 (FAISS)**：为处理近 40 万句子的极速查询召回，在 Tab 4 深度集成了 CPU 级的 Facebook AI 相似度计算库 (FAISS IndexFlatIP)。它将原本 PyTorch 矩阵暴力内积的上百毫秒时间，进一步惊人地压缩到了 `1~3 ms` (毫秒) 级别！完美再现了大厂工业级搜索引擎的倒排检索引擎。
+
+### 11. 工程演进：面向对象与 MVC 解耦
+
+随着四种模型基座（双塔极简、CNN、LSTM、Transformer）的大一统，原始前端代码与底层张量计算严重耦合。我们随后提炼了计算管线化引擎：
+
+- 将训练闭包、批量转移 (`to(device)`)、张量拼装以及所有的推理解码提取到了极其纯净的 `DualEncoderEngine` (engine.py) 面向对象类中。
+- 前端 `app.py` 经大幅瘦身，现在仅具有调用 `.train()`, `.predict_similarity()`, `.encode()` 三个极简 API 的责任，使项目迈入规范的跨端部署级别。
 
 ## 🪄 组件说明
 
 本次核心构建引入了以下分离的模块结构：
 
-- `data.py` - 轻量级文本读取与批处理预备队；
-- `model.py` - 最裸露纯粹的数学计算映射模型；
-- `train.py` - 模型训练工厂与优化循环封装；
-- `app.py` - 全局调度指挥与 Streamlit 交互呈现门户。
+- `data.py` - 轻量级文本读取、离线序列化缓存机制与批处理预备队；
+- `model.py` - 最裸露纯粹的数学双塔计算映射模型大全（MeanPool/CNN/LSTM/Transformer）；
+- `engine.py` - 核心模型封装机器，隐藏了繁琐的张量流转与梯度剪裁保护逻辑；
+- `train.py` - (已下放) 最原始版本的模型训练工厂参考；
+- `app.py` - 全局调度指挥、向量检索与 Streamlit 交互呈现门户。
 
 ## 🚀 如何使用
 

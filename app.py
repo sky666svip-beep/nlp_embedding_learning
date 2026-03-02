@@ -2,14 +2,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from sklearn.decomposition import PCA
-from train import train_model
-from model import get_model
-from data import get_dataloader
+from engine import DualEncoderEngine
 import torch
 import os
 import pickle
 import matplotlib.pyplot as plt
 import time
+import faiss
 import faiss
 
 st.set_page_config(page_title="NLP Embedding 学习", layout="wide")
@@ -17,8 +16,8 @@ st.title("NLP Embedding 双塔模型")
 
 # Sidebar
 st.sidebar.header("[训练参数]")
-model_arch = st.sidebar.selectbox("模型架构", ["MeanPooling 极简双塔", "CNN 双塔", "LSTM 双塔"], index=0)
-model_type_map = {"MeanPooling 极简双塔": "mean_pooling", "CNN 双塔": "cnn", "LSTM 双塔": "lstm"}
+model_arch = st.sidebar.selectbox("模型架构", ["MeanPooling 极简双塔", "CNN 双塔", "LSTM 双塔", "Transformer 双塔"], index=0)
+model_type_map = {"MeanPooling 极简双塔": "mean_pooling", "CNN 双塔": "cnn", "LSTM 双塔": "lstm", "Transformer 双塔": "transformer"}
 selected_model_type = model_type_map[model_arch]
 
 dataset_scale = st.sidebar.selectbox("训练数据规模", [
@@ -91,9 +90,11 @@ if start_train:
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # 计算总 batch 数
-        tok_type = "word" if selected_model_type in ("cnn", "lstm") else "char"
-        mock_dl, mock_tk = get_dataloader(selected_dataset_path, batch_size=batch_size, tokenizer_type=tok_type)
+        engine = DualEncoderEngine(selected_model_type, embed_dim=embed_dim)
+        
+        # 计算总 batch 数以设置进度条
+        from data import get_dataloader
+        mock_dl, mock_tk = get_dataloader(selected_dataset_path, batch_size=batch_size, tokenizer_type=engine.tok_type)
         total_batches = len(mock_dl)
         total_steps = epochs * total_batches
         
@@ -107,9 +108,9 @@ if start_train:
                 status_text.text(f"Epoch {epoch+1}/{epochs} 完成 | 平均Loss: {loss:.4f} | 末尾Acc: {batch_acc:.4f}")
             
         with st.spinner(f"模型 ({model_arch}) 正在学习语义分布中..."):
-            model, tokenizer = train_model(selected_dataset_path, epochs, batch_size, lr, embed_dim, model_type=selected_model_type, callback=train_callback)
-            st.session_state.model_state = model.state_dict()
-            st.session_state.tokenizer = tokenizer
+            engine.train(selected_dataset_path, epochs=epochs, batch_size=batch_size, lr=lr, callback=train_callback)
+            st.session_state.model_state = engine.model.state_dict()
+            st.session_state.tokenizer = engine.tokenizer
             st.session_state.model_type = selected_model_type
             
         # 训练结束后一次性渲染最终曲线
@@ -144,68 +145,50 @@ else:
             st.info("请先在侧边栏点击【开始训练】。")
 
 @st.cache_resource
-def get_cached_model(model_type, model_state_bytes, _tokenizer):
-    """缓存加载的模型，避免每次重新构建和加载权重。
-    注意：model_state_bytes 是为了让 Streamlit 识别状态变化，_tokenizer 用下划线忽略 hash"""
-    tk = _tokenizer
-    mod = get_model(model_type, len(tk.vocab), embed_dim)
-    # Streamlit 缓存机制要求参数是可哈希的，所以我们存状态字典时外层用 bytes 或者只让上层判断
-    # 这里通过 cache_resource 只在首次或内容变化时初始化一次
+def get_cached_engine(model_type, model_state_bytes, _tokenizer):
+    """缓存加载的模型引擎，避免每次重新构建和加载权重。"""
     import io
     buffer = io.BytesIO(model_state_bytes)
     state = torch.load(buffer, weights_only=True)
-    mod.load_state_dict(state)
-    mod.eval()
-    return mod, tk
+    engine = DualEncoderEngine(model_type, embed_dim=embed_dim, tokenizer=_tokenizer, model_state=state)
+    return engine
 
-def get_loaded_model():
+def get_loaded_engine():
     if not st.session_state.model_state or not st.session_state.tokenizer:
-        return None, None
+        return None
     import io
     buffer = io.BytesIO()
     torch.save(st.session_state.model_state, buffer)
-    mod, tk = get_cached_model(st.session_state.model_type, buffer.getvalue(), st.session_state.tokenizer)
-    return mod, tk
+    engine = get_cached_engine(st.session_state.model_type, buffer.getvalue(), st.session_state.tokenizer)
+    return engine
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 
 @st.cache_data
-def compute_similarity_distribution(version, _model, _tokenizer, dataset_path):
+def compute_similarity_distribution(version, _engine, dataset_path):
     """计算数据集的全局相似度分布，通过 version 参数控制刷新"""
     df = pd.read_csv(dataset_path)
-    mod = _model.to(device)
-    pos_sims, neg_sims = [], []
     
-    # 批处理批量推理，大幅提升速度 (取代原来基于 df.iterrows 的单条推理)
-    batch_size = 256
-    labels = torch.tensor(df['label'].values)
+    # 使用统一推理引擎
+    s1_list = df['sentence1'].tolist()
+    s2_list = df['sentence2'].tolist()
+    labels = df['label'].values
     
-    for i in range(0, len(df), batch_size):
-        batch_df = df.iloc[i:i+batch_size]
-        s1_batch = [torch.tensor(_tokenizer.encode(s, max_len=32)) for s in batch_df['sentence1']]
-        s2_batch = [torch.tensor(_tokenizer.encode(s, max_len=32)) for s in batch_df['sentence2']]
-        
-        id1 = torch.stack(s1_batch).to(device)
-        id2 = torch.stack(s2_batch).to(device)
-        
-        with torch.no_grad():
-            sim, _, _ = mod(id1, id2)
-        sim_val = sim.cpu().numpy()
-        
-        batch_labels = labels[i:i+batch_size].numpy()
-        pos_sims.extend(sim_val[batch_labels == 1])
-        neg_sims.extend(sim_val[batch_labels == 0])
-        
+    sim_vals = _engine.predict_similarity(s1_list, s2_list, batch_size=256)
+    
+    pos_sims = sim_vals[labels == 1].tolist()
+    neg_sims = sim_vals[labels == 0].tolist()
+    
     return pos_sims, neg_sims
 
 with tab1:
     st.divider()
     st.subheader("[全局预测分布透视图] (相似度分布直方图)")
     if st.session_state.model_state:
-        mod, tk = get_loaded_model()
+        engine = get_loaded_engine()
         
         with st.spinner("计算全局相似度分布 (已利用 GPU 批处理提速 & 数据缓存)..."):
-            pos_sims, neg_sims = compute_similarity_distribution(st.session_state.train_version, mod, tk, selected_dataset_path)
+            pos_sims, neg_sims = compute_similarity_distribution(st.session_state.train_version, engine, selected_dataset_path)
             
             fig, ax = plt.subplots(figsize=(8, 3))
             ax.hist(pos_sims, bins=np.linspace(-1, 1, 21), alpha=0.6, label='Similar (Label=1)', color='green')
@@ -220,29 +203,25 @@ with tab1:
         st.info("尚未完成训练，无法查看分布直方图。")
 
 @st.cache_data
-def get_pca_data(version, _model, _tokenizer, sentences):
+def get_pca_data(version, _engine, sentences):
     """缓存 PCA 降维坐标"""
-    mod = _model.to(device)
-    embs = []
-    with torch.no_grad():
-        for s in sentences:
-            ids = torch.tensor([_tokenizer.encode(s, max_len=32)], dtype=torch.long).to(device)
-            vec = mod.encode_single(ids)
-            embs.append(vec.squeeze(0).cpu().numpy())
-    coords = PCA(n_components=2).fit_transform(np.array(embs))
-    return coords
+    embs = _engine.encode(sentences, batch_size=256)
+    if len(embs) > 0:
+        coords = PCA(n_components=2).fit_transform(embs)
+        return coords
+    return np.array([])
 
 with tab2:
     st.subheader("二维句子空间分布 (PCA降维)")
     st.markdown("将高维的句子向量压缩至2D平面，距离相近的点代表模型认为它们语义相似。")
     if st.session_state.model_state:
-        mod, tk = get_loaded_model()
+        engine = get_loaded_engine()
         df = pd.read_csv(selected_dataset_path)
         # 提取前 30 对句子用于展示
         sentences = list(set(df['sentence1'].tolist()[:30] + df['sentence2'].tolist()[:30]))
         
         with st.spinner("抽取高维特征并计算 PCA..."):
-            coords = get_pca_data(st.session_state.train_version, mod, tk, sentences)
+            coords = get_pca_data(st.session_state.train_version, engine, sentences)
             chart_df = pd.DataFrame({"X": coords[:, 0], "Y": coords[:, 1], "Text": sentences})
             
             # Use columns to lay out side-by-side
@@ -257,19 +236,16 @@ with tab2:
 
 with tab3:
     st.subheader("输入两句话，预测相似度指数")
-    mod, tk = get_loaded_model()
+    engine = get_loaded_engine()
     
     col1, col2 = st.columns(2)
     s1 = col1.text_input("第一句话", "苹果手机怎么截图")
     s2 = col2.text_input("第二句话", "iPhone屏显怎么截")
         
     if st.button("计算相似度", type="primary"):
-        if mod:
-            mod = mod.to(device)
-            id1 = torch.tensor([tk.encode(s1, max_len=32)], dtype=torch.long).to(device)
-            id2 = torch.tensor([tk.encode(s2, max_len=32)], dtype=torch.long).to(device)
-            sim, _, _ = mod(id1, id2)
-            similarity_score = sim.cpu().item()
+        if engine:
+            sims = engine.predict_similarity([s1], [s2])
+            similarity_score = sims[0]
             
             st.metric(label="Cosine Similarity (余弦相似度)", value=f"{similarity_score:.4f}")
             if similarity_score > 0.5:
@@ -295,8 +271,7 @@ with tab4:
         if not st.session_state.model_state:
             st.error("出错： 当前无可用模型！请先在侧拉栏点击【开始训练】。")
         else:
-            mod, tk = get_loaded_model()
-            mod = mod.to(device)
+            engine = get_loaded_engine()
             df = pd.read_csv(selected_dataset_path)
             
             with st.spinner("1/3 正在提取唯一句子字典 (过滤重复语句)..."):
@@ -309,31 +284,21 @@ with tab4:
                 labels = unique_df['label'].tolist()
             
             with st.spinner(f"2/3 正在使用 GPU 将 {len(sentences)} 条语句编码为高维特征 (可能耗时数十秒)..."):
-                all_embeddings = []
-                batch_size = 256
-                # 此处也应用批量处理加速
-                for i in range(0, len(sentences), batch_size):
-                    batch_texts = sentences[i:i+batch_size]
-                    # Tokenize
-                    ids = [torch.tensor(tk.encode(s, max_len=32)) for s in batch_texts]
-                    input_tensors = torch.stack(ids).to(device)
-                    with torch.no_grad():
-                        embs = mod.encode_single(input_tensors)
-                        embs = torch.nn.functional.normalize(embs, p=2, dim=1) # 必须 L2 标准化以计算余弦/内积
-                    all_embeddings.append(embs.cpu())
-                    
-                full_tensor = torch.cat(all_embeddings, dim=0) # [N, embed_dim]
+                np_embeddings = engine.encode(sentences, batch_size=256)
+                norms = np.linalg.norm(np_embeddings, axis=1, keepdims=True)
+                np_embeddings = np_embeddings / np.clip(norms, 1e-9, None)
+                full_tensor = torch.tensor(np_embeddings).to(engine.device)
                 
             with st.spinner("3/3 正在构建 FAISS 倒排索引..."):
-                np_embeddings = full_tensor.numpy().astype('float32') # FAISS 强依赖 float32 numpy 格式
+                np_embeddings_f32 = np_embeddings.astype('float32')
                 # 使用内积 (Inner Product) 索引评估，因为标准化后内积 == 余弦相似度
                 faiss_index = faiss.IndexFlatIP(embed_dim) 
-                faiss_index.add(np_embeddings)
+                faiss_index.add(np_embeddings_f32)
 
             # 保存到 session
             st.session_state.vector_db = {
-                "tensor": full_tensor.to(device), # 暴力矩阵搜索用
-                "faiss": faiss_index,             # FAISS 查表搜索用
+                "tensor": full_tensor, 
+                "faiss": faiss_index,             
                 "texts": sentences,
                 "labels": labels
             }
@@ -350,33 +315,31 @@ with tab4:
             top_k = st.slider("想要召回的数量 (Top-K):", min_value=1, max_value=50, value=10)
             
         if st.button("开始双轨平行检索", use_container_width=True):
-            mod, tk = get_loaded_model()
-            mod = mod.to(device)
+            engine = get_loaded_engine()
+            
             # 1. 编码用户的查询语句
-            id_query = torch.tensor([tk.encode(query, max_len=32)], dtype=torch.long).to(device)
-            with torch.no_grad():
-                q_emb = mod.encode_single(id_query)
-                q_emb = torch.nn.functional.normalize(q_emb, p=2, dim=1)
+            q_emb_np = engine.encode([query])
+            norms = np.linalg.norm(q_emb_np, axis=1, keepdims=True)
+            q_emb_np = q_emb_np / np.clip(norms, 1e-9, None)
+            
+            q_emb_tensor = torch.tensor(q_emb_np).to(engine.device)
             
             db = st.session_state.vector_db
                 
             # 轨 1: PyTorch 纯矩阵暴力点乘算分
             pt_start = time.time()
-            # q_emb [1, D], db['tensor'] [N, D] -> 分数 [1, N]
-            all_scores = torch.matmul(q_emb, db['tensor'].t()) 
+            all_scores = torch.matmul(q_emb_tensor, db['tensor'].t()) 
             top_scores, top_indices = torch.topk(all_scores, k=top_k, dim=1)
             pt_end = time.time()
             pt_time_ms = (pt_end - pt_start) * 1000
             
             # 轨 2: FAISS 高速相似度查表算分
-            np_q = q_emb.cpu().numpy().astype('float32')
+            np_q = q_emb_np.astype('float32')
             faiss_start = time.time()
             f_scores, f_indices = db['faiss'].search(np_q, top_k)
             faiss_end = time.time()
             faiss_time_ms = (faiss_end - faiss_start) * 1000
             st.markdown(f"**检索性能对比:** `PyTorch:` **{pt_time_ms:.2f} 毫秒** vs `FAISS:` **{faiss_time_ms:.2f} 毫秒**")
-            
-            # 通过大语料 (lcqmc_max 24w 去重后大概 38 万 unique 句子)，可观察到两者巨大差异
             
             # 组装召回结果为直观表格
             results = []

@@ -1,6 +1,19 @@
+import os
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+os.environ["DISABLE_SAFETENSORS_CONVERSION"] = "1"
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _load_roberta(model_name):
+    """加载 RoBERTa 底座：本地缓存优先，无网络请求则不触发 403"""
+    from transformers import AutoModel
+    try:
+        return AutoModel.from_pretrained(model_name, local_files_only=True)
+    except OSError:
+        print(f"[下载] 本地无缓存，正在从镜像站下载 {model_name}...")
+        return AutoModel.from_pretrained(model_name)
 
 class SimpleDualEncoder(nn.Module):
     """极简双塔：Embedding + LayerNorm + MeanPooling + 投影层"""
@@ -201,10 +214,7 @@ class PretrainedDualEncoder(nn.Module):
 
     def __init__(self, embed_dim=128):
         super().__init__()
-        from transformers import AutoModel
-        
-        # 加载预训练的 RoBERTa 模型 (hidden_size=768, 12层Transformer)
-        self.roberta = AutoModel.from_pretrained(self.PRETRAINED_NAME)
+        self.roberta = _load_roberta(self.PRETRAINED_NAME)
         hidden_size = self.roberta.config.hidden_size  # 768
         
         # 冻结策略：固定 Embedding + 底部 8 层 Encoder
@@ -283,11 +293,9 @@ class LoRADualEncoder(nn.Module):
     
     def __init__(self, embed_dim=128):
         super().__init__()
-        from transformers import AutoModel
-        from peft import get_peft_model, LoraConfig, TaskType
-        
         # 第一步：加载原始 RoBERTa (hidden_size=768, 12层 Transformer)
-        base_model = AutoModel.from_pretrained(self.PRETRAINED_NAME)
+        from peft import get_peft_model, LoraConfig, TaskType
+        base_model = _load_roberta(self.PRETRAINED_NAME)
         hidden_size = base_model.config.hidden_size  # 768
         
         # 第二步：用 LoRA 包裹 —— 自动冻结所有原始参数，只有 LoRA 矩阵可训练

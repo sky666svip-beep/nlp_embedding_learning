@@ -176,7 +176,8 @@ def get_pretrained_dataloader(csv_path, tokenizer, batch_size=32, max_len=128):
         print(f"[缓存] 命中预训练数据缓存: {cache_key}，极速加载中...")
         with open(dataset_cache_path, "rb") as f:
             dataset = pickle.load(f)
-        return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                         pin_memory=True, num_workers=2, persistent_workers=True)
     
     print(f"[处理] 预训练数据首次编码 {csv_path} (请耐心等待)...")
     df = pd.read_csv(csv_path)
@@ -200,5 +201,6 @@ def get_pretrained_dataloader(csv_path, tokenizer, batch_size=32, max_len=128):
         pickle.dump(dataset, f)
     print(f"[成功] 预训练数据缓存写入完成: {cache_key}")
     
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                     pin_memory=True, num_workers=2, persistent_workers=True)
 

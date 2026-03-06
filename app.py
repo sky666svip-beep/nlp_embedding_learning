@@ -1,17 +1,17 @@
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 from sklearn.decomposition import PCA
 from engine import DualEncoderEngine
 import torch
-import os
 import pickle
 import matplotlib.pyplot as plt
 import time
 import faiss
 
-# 注入 Hugging Face 国内镜像，解决预训练权重下载卡死/超时问题
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 st.set_page_config(page_title="NLP Embedding 学习", layout="wide")
 st.title("NLP Embedding 双塔模型")

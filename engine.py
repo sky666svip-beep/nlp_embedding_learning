@@ -1,8 +1,9 @@
+import os
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
 import torch
 import sys
 import pickle
-import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import torch.nn as nn
 from model import get_model
@@ -22,6 +23,9 @@ class DualEncoderEngine:
     """
     def __init__(self, model_type, embed_dim=128, vocab_size=None, model_state=None, tokenizer=None, device=None):
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+        # cuDNN 自动调优：为固定尺寸输入选择最快算法
+        if self.device.type == 'cuda':
+            torch.backends.cudnn.benchmark = True
         self.model_type = model_type
         self.embed_dim = embed_dim
         self.is_pretrained = (model_type in ("pretrained", "lora"))
@@ -34,11 +38,14 @@ class DualEncoderEngine:
         
         self.tokenizer = tokenizer
         
-        # 预训练模型需要 HuggingFace Tokenizer
+        # 预训练模型需要 HuggingFace Tokenizer (本地优先，避免 403)
         if self.is_pretrained and self.tokenizer is None:
             from transformers import AutoTokenizer
-            # LoRA 和冻结层共用同一个预训练底座的 Tokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained("hfl/chinese-roberta-wwm-ext")
+            _name = "hfl/chinese-roberta-wwm-ext"
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(_name, local_files_only=True)
+            except OSError:
+                self.tokenizer = AutoTokenizer.from_pretrained(_name)
         
         # 初始化底座模型
         if self.is_pretrained:
@@ -107,41 +114,50 @@ class DualEncoderEngine:
         return self
     
     def _train_pretrained(self, data_path, epochs, batch_size, lr, callback):
-        """预训练模型微调流程 (RoBERTa)"""
-        # 使用 HuggingFace Tokenizer 加载数据
+        """预训练模型微调流程 (RoBERTa) — 支持 AMP 混合精度加速"""
         dataloader = get_pretrained_dataloader(data_path, self.tokenizer, batch_size=batch_size)
         
-        # 重建模型（确保冻结策略生效）
-        self.model = get_model(self.model_type, embed_dim=self.embed_dim).to(self.device)
+        # 直接复用 __init__ 中已创建的模型，无需重复实例化
+        self.model.train()
         
-        # 只优化未冻结的参数 (顶部4层 + attention + projection)
         trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
         optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.01)
         criterion = nn.MSELoss()
         
+        # AMP 混合精度：仅 CUDA 环境启用 (MPS/CPU 不支持)
+        use_amp = (self.device.type == 'cuda')
+        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+        
         total_batches = len(dataloader)
+        tag = "LoRA" if self.model_type == "lora" else "Pretrained"
+        if use_amp:
+            print(f"[{tag}] AMP 混合精度已启用 (FP16 加速)")
         
         for epoch in range(epochs):
             self.model.train()
             total_loss = 0.0
             
             for batch_idx, (ids1, mask1, ids2, mask2, label) in enumerate(dataloader):
-                ids1 = ids1.to(self.device)
-                mask1 = mask1.to(self.device)
-                ids2 = ids2.to(self.device)
-                mask2 = mask2.to(self.device)
-                label = label.to(self.device)
+                ids1 = ids1.to(self.device, non_blocking=True)
+                mask1 = mask1.to(self.device, non_blocking=True)
+                ids2 = ids2.to(self.device, non_blocking=True)
+                mask2 = mask2.to(self.device, non_blocking=True)
+                label = label.to(self.device, non_blocking=True)
                 
-                optimizer.zero_grad()
-                sim, _, _ = self.model(ids1, mask1, ids2, mask2)
+                optimizer.zero_grad(set_to_none=True)
                 
-                target_sim = label * 2.0 - 1.0
-                loss = criterion(sim, target_sim)
-                loss.backward()
+                # AMP 自动混合精度前向传播
+                with torch.amp.autocast('cuda', enabled=use_amp):
+                    sim, _, _ = self.model(ids1, mask1, ids2, mask2)
+                    target_sim = label * 2.0 - 1.0
+                    loss = criterion(sim, target_sim)
                 
-                # 预训练模型同样需要梯度裁剪
+                # AMP 缩放反向传播
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 
                 correct = ((sim > 0) == (target_sim > 0)).float().sum()
                 batch_acc = (correct / label.size(0)).item()
@@ -152,7 +168,6 @@ class DualEncoderEngine:
                     callback(epoch, batch_idx, loss.item(), batch_acc)
             
             avg_loss = total_loss / total_batches
-            tag = "LoRA" if self.model_type == "lora" else "Pretrained"
             print(f"[{tag}] Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
         
         return self

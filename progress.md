@@ -105,3 +105,22 @@
   2. **收紧分布方差**：为底层随机状态的 `nn.Embedding` 应用了方差仅为 0.02 的标准正态初始化。
   3. **废除降维线性映射池化**：将原来极易产生特征颈部瓶颈的 `Mean Pooling + Projection Linear` 替换为了类似 `LSTM` 中的 `Self-Attention Pooling` 加权求和机制。强迫模型在整句话中学习到关键词权重，显著剥离了相似与不相似的两级分布。
 - **阶段完成**：Transformer 终于能够在未经预训练的情况下收敛出清晰的特征区分度，具备了进行下游微调的稳定底座能力。
+
+## 2026-03-06 (增量开发十二: 预训练大模型引入)
+
+- **目标**：引入 `hfl/chinese-roberta-wwm-ext` 预训练权重，从"白盒手搭"跨越到"预训练微调"范式。
+- **当前进展**：
+  1. **模型架构 (`PretrainedDualEncoder`)**：加载哈工大全词掩码 RoBERTa (12层, 768维, 约1.03亿参数)。采用 B 方案冻结策略：固定 Embedding + 底部 8 层 Encoder (71.2%)，仅微调顶部 4 层 + Attention Pooling + 投影层 (28.8%, 约2963万参数)。
+  2. **数据层重构 (`PretrainedSTSDataset`)**：为预训练模型独立构建数据集类，使用 HuggingFace BPE Tokenizer 预先批量编码全量数据 (比逐样本调用快几十倍)，并支持 `.pkl` 离线缓存。
+  3. **引擎层双分支 (`DualEncoderEngine`)**：engine 新增 `is_pretrained` 标志位，训练走 `AdamW + 梯度裁剪`，推理走 HuggingFace Tokenizer 编码路径，与手搭模型完全隔离互不影响。
+  4. **前端集成**：`app.py` 新增"RoBERTa 预训练双塔"选项，配套独立的低 LR 超参推荐 (2e-5)，首次选择时提示下载约400MB权重。
+- **阶段完成**：迷你集 1 epoch 冒烟测试通过 (余弦相似度 0.8669)，预训练模型作为第 5 种可选架构成功并入体系。
+
+## 2026-03-06 (增量开发十三: LoRA 低秩适应微调)
+
+- **目标**：引入 LoRA 作为第三种预训练微调策略，与冻结层方案并存对比，核心动机是教学演示。
+- **当前进展**：
+  1. **模型架构 (`LoRADualEncoder`)**：使用 `peft` 库的 `get_peft_model()` 全量冻结 RoBERTa，仅在 12 层 Transformer 的 query/value 矩阵中注入 LoRA 低秩适配器 (r=8, alpha=16)。可训练参数仅约 28,750，对比冻结层方案的 2963 万减少 99%。
+  2. **管线复用**：LoRA 完全复用 pretrained 的数据加载、训练循环、编码和预测管线。engine 仅修改 `is_pretrained` 判断条件。
+  3. **前端集成**：`app.py` 新增 "RoBERTa LoRA 双塔" 选项，共享预训练模型的超参推荐，侧边栏区分两种策略的说明文字。
+- **阶段完成**：冒烟测试全部通过（模型加载、前向传播、Engine 集成），LoRA 作为第 6 种可选架构成功并入体系。

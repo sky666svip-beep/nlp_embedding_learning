@@ -75,6 +75,20 @@
 | 初始任务为 STS   | 用户明确要求先做 STS（计算两个句子语义相似度打分）。                                         | 确定   |
 | 基于网页形式部署 | 用户要求“可视化见到训练过程和各种效果”，采用 Streamlit/Gradio 能最快打通训练图表与推理交互。 | 确定   |
 
+### 阶段十二：预训练大模型引入 (Complete)
+
+- [x] 引入 `transformers` 库，加载 `hfl/chinese-roberta-wwm-ext` 预训练权重。
+- [x] 实现 `PretrainedDualEncoder`：冻结底部 8 层 Encoder + Embedding，仅微调顶部 4 层 + Attention Pooling + 投影层 (B 方案)。
+- [x] 在 `engine.py` 中实现预训练/手搭双分支的训练、编码、预测接口。
+- [x] 前端 `app.py` 新增"RoBERTa 预训练双塔"选项并配套低 LR 超参推荐。
+
+### 阶段十三：LoRA 低秩适应微调 (Complete)
+
+- [x] 引入 `peft` 库，实现 `LoRADualEncoder`：全量冻结 RoBERTa + LoRA 注入 Q/V 矩阵 (r=8, alpha=16)。
+- [x] 复用 pretrained 的全部数据/训练/推理管线，engine 仅扩展 is_pretrained 判断。
+- [x] 前端新增 "RoBERTa LoRA 双塔" 选项，与冻结层方案并存对比。
+- [x] 冒烟测试通过：可训练参数约 28,750 (含 LoRA 矩阵 + Pooling + Projection)。
+
 ## 错误记录
 
 | 错误   | 发生阶段 | 解决方案 |

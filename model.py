@@ -184,16 +184,178 @@ class TransformerDualEncoder(nn.Module):
         sim = F.cosine_similarity(vec1, vec2, dim=-1)
         return sim, vec1, vec2
 
+
+class PretrainedDualEncoder(nn.Module):
+    """预训练双塔：RoBERTa-wwm-ext (冻结底层8层) + Attention Pooling + 投影层
+    
+    采用 B 方案微调策略：
+    - 冻结: Embedding层 + Encoder Layer 0~7 (共8层)
+    - 可训练: Encoder Layer 8~11 (共4层) + Attention Pooling + 投影层
+    
+    教学重点：让学习者直观感受"预训练底座提供的通用语义 vs 上层微调带来的任务适配"。
+    """
+    # 预训练模型名称 (哈工大全词掩码中文RoBERTa)
+    PRETRAINED_NAME = "hfl/chinese-roberta-wwm-ext"
+    # 冻结的 encoder 层数 (底部8层不参与训练)
+    FREEZE_LAYERS = 8
+
+    def __init__(self, embed_dim=128):
+        super().__init__()
+        from transformers import AutoModel
+        
+        # 加载预训练的 RoBERTa 模型 (hidden_size=768, 12层Transformer)
+        self.roberta = AutoModel.from_pretrained(self.PRETRAINED_NAME)
+        hidden_size = self.roberta.config.hidden_size  # 768
+        
+        # 冻结策略：固定 Embedding + 底部 8 层 Encoder
+        self._freeze_base_layers()
+        
+        # 自注意力池化：复用项目中已验证有效的 Attention Pooling 机制
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1)
+        )
+        
+        # 投影层：将 RoBERTa 的 768 维压缩到项目统一的 embed_dim
+        self.projection = nn.Linear(hidden_size, embed_dim)
+        self.dropout = nn.Dropout(0.1)
+    
+    def _freeze_base_layers(self):
+        """冻结 Embedding 层和底部 FREEZE_LAYERS 层 Encoder"""
+        # 冻结词嵌入层
+        for param in self.roberta.embeddings.parameters():
+            param.requires_grad = False
+        
+        # 冻结底部的 encoder 层
+        for i in range(self.FREEZE_LAYERS):
+            for param in self.roberta.encoder.layer[i].parameters():
+                param.requires_grad = False
+    
+    def encode_single(self, input_ids, attention_mask):
+        """将单个序列编码为句子向量
+        
+        与其他手搭模型不同，预训练模型需要 attention_mask 来区分有效 token 和 padding。
+        """
+        # RoBERTa 前向传播：获取所有层的隐状态
+        outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
+        hidden_states = outputs.last_hidden_state  # (batch, seq_len, 768)
+        
+        # Attention Pooling：计算每个 token 的重要性权重
+        attn_weights = self.attention(hidden_states).squeeze(-1)  # (batch, seq_len)
+        # 用 attention_mask 遮蔽 padding 位置 (mask=0 的位置设为极小值)
+        attn_weights = attn_weights.masked_fill(attention_mask == 0, -1e9)
+        attn_weights = F.softmax(attn_weights, dim=1)  # (batch, seq_len)
+        
+        # 加权求和得到句子级向量
+        vec = (hidden_states * attn_weights.unsqueeze(-1)).sum(dim=1)  # (batch, 768)
+        vec = self.dropout(vec)
+        vec = self.projection(vec)  # (batch, embed_dim)
+        return vec
+    
+    def forward(self, input_ids_1, attention_mask_1, input_ids_2, attention_mask_2):
+        """双塔前向传播：两段输入分别编码后计算余弦相似度"""
+        vec1 = self.encode_single(input_ids_1, attention_mask_1)
+        vec2 = self.encode_single(input_ids_2, attention_mask_2)
+        sim = F.cosine_similarity(vec1, vec2, dim=-1)
+        return sim, vec1, vec2
+
+
+class LoRADualEncoder(nn.Module):
+    """LoRA 双塔：RoBERTa-wwm-ext + LoRA 低秩适应 + Attention Pooling + 投影层
+    
+    全量冻结 RoBERTa 所有原始参数，仅通过 LoRA 在 query/value 矩阵中
+    注入低秩可训练参数。可训练参数量约 30~50 万 (对比冻结层方案的 2963 万)。
+    
+    教学重点：
+    - LoRA 不修改原始权重，而是给每个目标矩阵旁路注入 A*B 低秩分解
+    - r=8 意味着每个注入点只增加 768*8 + 8*768 = 12288 个参数
+    - 训练效率高：显存占用比冻结层方案低 10%-20%
+    """
+    # 复用预训练模型名称
+    PRETRAINED_NAME = "hfl/chinese-roberta-wwm-ext"
+    # LoRA 超参数 (经典配置)
+    LORA_R = 8           # 低秩维度
+    LORA_ALPHA = 16      # 缩放因子 (alpha/r = 2 倍缩放)
+    LORA_DROPOUT = 0.1   # LoRA 层 Dropout
+    # 注入目标：自注意力的 Query 和 Value 矩阵
+    LORA_TARGET_MODULES = ["query", "value"]
+    
+    def __init__(self, embed_dim=128):
+        super().__init__()
+        from transformers import AutoModel
+        from peft import get_peft_model, LoraConfig, TaskType
+        
+        # 第一步：加载原始 RoBERTa (hidden_size=768, 12层 Transformer)
+        base_model = AutoModel.from_pretrained(self.PRETRAINED_NAME)
+        hidden_size = base_model.config.hidden_size  # 768
+        
+        # 第二步：用 LoRA 包裹 —— 自动冻结所有原始参数，只有 LoRA 矩阵可训练
+        lora_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=self.LORA_R,
+            lora_alpha=self.LORA_ALPHA,
+            lora_dropout=self.LORA_DROPOUT,
+            target_modules=self.LORA_TARGET_MODULES,
+        )
+        self.roberta = get_peft_model(base_model, lora_config)
+        
+        # 打印可训练参数统计 (教学用)
+        self.roberta.print_trainable_parameters()
+        
+        # 第三步：自注意力池化 + 投影层 (与冻结层方案共享相同结构)
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1)
+        )
+        self.projection = nn.Linear(hidden_size, embed_dim)
+        self.dropout = nn.Dropout(0.1)
+    
+    def encode_single(self, input_ids, attention_mask):
+        """将单个序列编码为句子向量 (接口与 PretrainedDualEncoder 完全一致)"""
+        # LoRA 包裹后的 RoBERTa 前向传播：低秩旁路自动生效
+        outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
+        hidden_states = outputs.last_hidden_state  # (batch, seq_len, 768)
+        
+        # Attention Pooling
+        attn_weights = self.attention(hidden_states).squeeze(-1)
+        attn_weights = attn_weights.masked_fill(attention_mask == 0, -1e9)
+        attn_weights = F.softmax(attn_weights, dim=1)
+        
+        vec = (hidden_states * attn_weights.unsqueeze(-1)).sum(dim=1)
+        vec = self.dropout(vec)
+        vec = self.projection(vec)
+        return vec
+    
+    def forward(self, input_ids_1, attention_mask_1, input_ids_2, attention_mask_2):
+        """双塔前向传播：两段输入分别编码后计算余弦相似度"""
+        vec1 = self.encode_single(input_ids_1, attention_mask_1)
+        vec2 = self.encode_single(input_ids_2, attention_mask_2)
+        sim = F.cosine_similarity(vec1, vec2, dim=-1)
+        return sim, vec1, vec2
+
+
 # 工厂函数：根据名称创建对应模型
 MODEL_REGISTRY = {
     "mean_pooling": SimpleDualEncoder,
     "cnn": CNNDualEncoder,
     "lstm": LSTMDualEncoder,
     "transformer": TransformerDualEncoder,
+    "pretrained": PretrainedDualEncoder,
+    "lora": LoRADualEncoder,
 }
 
-def get_model(model_type, vocab_size, embed_dim=128):
+def get_model(model_type, vocab_size=0, embed_dim=128):
+    """根据模型类型创建对应的双塔模型实例。
+    
+    预训练模型不需要 vocab_size (自带词表)，其他手搭模型需要。
+    """
     cls = MODEL_REGISTRY.get(model_type)
     if cls is None:
         raise ValueError(f"未知模型类型: {model_type}，可选: {list(MODEL_REGISTRY.keys())}")
+    
+    # 预训练模型 (冻结层/LoRA) 只需要 embed_dim，不需要 vocab_size
+    if model_type in ("pretrained", "lora"):
+        return cls(embed_dim=embed_dim)
     return cls(vocab_size, embed_dim)

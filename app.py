@@ -9,16 +9,19 @@ import pickle
 import matplotlib.pyplot as plt
 import time
 import faiss
-import faiss
+
+# 注入 Hugging Face 国内镜像，解决预训练权重下载卡死/超时问题
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 st.set_page_config(page_title="NLP Embedding 学习", layout="wide")
 st.title("NLP Embedding 双塔模型")
 
 # Sidebar
 st.sidebar.header("[训练参数]")
-model_arch = st.sidebar.selectbox("模型架构", ["MeanPooling 极简双塔", "CNN 双塔", "LSTM 双塔", "Transformer 双塔"], index=0)
-model_type_map = {"MeanPooling 极简双塔": "mean_pooling", "CNN 双塔": "cnn", "LSTM 双塔": "lstm", "Transformer 双塔": "transformer"}
+model_arch = st.sidebar.selectbox("模型架构", ["MeanPooling 极简双塔", "CNN 双塔", "LSTM 双塔", "Transformer 双塔", "RoBERTa 预训练双塔 (冻结层)", "RoBERTa LoRA 双塔"], index=0)
+model_type_map = {"MeanPooling 极简双塔": "mean_pooling", "CNN 双塔": "cnn", "LSTM 双塔": "lstm", "Transformer 双塔": "transformer", "RoBERTa 预训练双塔 (冻结层)": "pretrained", "RoBERTa LoRA 双塔": "lora"}
 selected_model_type = model_type_map[model_arch]
+is_pretrained = (selected_model_type in ("pretrained", "lora"))
 
 dataset_scale = st.sidebar.selectbox("训练数据规模", [
     "全量集 (lcqmc_max, 约24w条)", 
@@ -35,20 +38,38 @@ selected_dataset_path = dataset_map[dataset_scale]
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("[推荐参数设置]")
-if "max" in selected_dataset_path:
-    st.sidebar.info("大语料建议：Epochs: 1-3 | LR: 0.0005 | Batch Size: 128或256")
-    default_epochs, default_lr, default_batch = 2, 0.0005, 3
-elif "2w" in selected_dataset_path:
-    st.sidebar.info("中语料建议：Epochs: 5-10 | LR: 0.001 | Batch Size: 64")
-    default_epochs, default_lr, default_batch = 5, 0.001, 2
+if is_pretrained:
+    # 预训练模型使用独立的超参推荐策略 (低学习率、少轮次)
+    if "max" in selected_dataset_path:
+        st.sidebar.info("[预训练-大语料] LR: 2e-5 | Epochs: 1-2 | Batch: 32")
+        default_epochs, default_lr, default_batch = 1, 2e-5, 1
+    elif "2w" in selected_dataset_path:
+        st.sidebar.info("[预训练-中语料] LR: 2e-5 | Epochs: 2-3 | Batch: 32")
+        default_epochs, default_lr, default_batch = 2, 2e-5, 1
+    else:
+        st.sidebar.info("[预训练-微语料] LR: 3e-5 | Epochs: 3-5 | Batch: 16")
+        default_epochs, default_lr, default_batch = 3, 3e-5, 0
 else:
-    st.sidebar.info("微语料建议：Epochs: 15-30 | LR: 0.005 | Batch Size: 16")
-    default_epochs, default_lr, default_batch = 15, 0.005, 0
+    if "max" in selected_dataset_path:
+        st.sidebar.info("大语料建议：Epochs: 1-3 | LR: 0.0005 | Batch Size: 128或256")
+        default_epochs, default_lr, default_batch = 2, 0.0005, 3
+    elif "2w" in selected_dataset_path:
+        st.sidebar.info("中语料建议：Epochs: 5-10 | LR: 0.001 | Batch Size: 64")
+        default_epochs, default_lr, default_batch = 5, 0.001, 2
+    else:
+        st.sidebar.info("微语料建议：Epochs: 15-30 | LR: 0.005 | Batch Size: 16")
+        default_epochs, default_lr, default_batch = 15, 0.005, 0
 
 epochs = st.sidebar.slider("Epochs", min_value=1, max_value=50, value=default_epochs)
-lr = st.sidebar.number_input("Learning Rate", value=default_lr, format="%.4f")
+lr = st.sidebar.number_input("Learning Rate", value=default_lr, format="%.6f")
 batch_size = st.sidebar.selectbox("Batch Size", [16, 32, 64, 128, 256], index=default_batch)
-embed_dim = st.sidebar.slider("词向量维度", min_value=8, max_value=256, value=128)
+# 预训练模型底座固定 768 维，投影层输出仍可调节
+embed_dim = st.sidebar.slider("词向量维度 (投影输出)", min_value=8, max_value=256, value=128)
+if is_pretrained:
+    if selected_model_type == "lora":
+        st.sidebar.caption("注: LoRA 全量冻结底座, 仅训练 Q/V 低秩矩阵 + Pooling + 投影层")
+    else:
+        st.sidebar.caption("注: RoBERTa 底座 hidden_size=768，此处控制投影层输出维度")
 
 if "model_state" not in st.session_state:
     st.session_state.model_state = None
@@ -92,9 +113,18 @@ if start_train:
         
         engine = DualEncoderEngine(selected_model_type, embed_dim=embed_dim)
         
-        # 计算总 batch 数以设置进度条
-        from data import get_dataloader
-        mock_dl, mock_tk = get_dataloader(selected_dataset_path, batch_size=batch_size, tokenizer_type=engine.tok_type)
+        # 展示预训练模型的可训练参数信息
+        if is_pretrained:
+            st.info("正在加载 RoBERTa-wwm-ext 预训练权重 (首次运行会自动下载约400MB)...")
+        
+        # 获取 DataLoader (预训练模型的全量集由于预先 Tokenize 可能耗时较长)
+        with st.spinner("正在加载与预处理数据集 (全量集首次 Tokenize 可能需要2-3分钟，建立缓存后将极速加载)..."):
+            if is_pretrained:
+                from data import get_pretrained_dataloader
+                mock_dl = get_pretrained_dataloader(selected_dataset_path, engine.tokenizer, batch_size=batch_size)
+            else:
+                from data import get_dataloader
+                mock_dl, mock_tk = get_dataloader(selected_dataset_path, batch_size=batch_size, tokenizer_type=engine.tok_type)
         total_batches = len(mock_dl)
         total_steps = epochs * total_batches
         
@@ -149,7 +179,7 @@ def get_cached_engine(model_type, model_state_bytes, _tokenizer):
     """缓存加载的模型引擎，避免每次重新构建和加载权重。"""
     import io
     buffer = io.BytesIO(model_state_bytes)
-    state = torch.load(buffer, weights_only=True)
+    state = torch.load(buffer, weights_only=False)
     engine = DualEncoderEngine(model_type, embed_dim=embed_dim, tokenizer=_tokenizer, model_state=state)
     return engine
 

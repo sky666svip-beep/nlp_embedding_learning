@@ -9,7 +9,7 @@
 
 ### 1. 数据集 (Dataset & Tokenization)
 
-- **数据**：使用经典的开源中文相似度数据集（LCQMC）的一个微型子集 `lcqmc_mini.csv`（包含 60 条典型的相似/不相似问答样本）。
+- **数据**：使用经典的开源中文相似度数据集（LCQMC）的一个微型子集 `lcqmc_mini.csv`（包含 5000 条典型的相似/不相似问答样本）。
 - **分词器（Tokenizer）**：手写了一个极为简单的 `SimpleCharTokenizer`。它通过一次遍历建立基于字 (Char-Level) 的词汇表，并在推断时处理填充 (Padding) 逻辑，展现“字到 ID 向量”的核心本质。
 - **打包**：借助 PyTorch 标准的 `Dataset` 和 `DataLoader` 配置，体现经典深度学习工程规范。
 

@@ -134,3 +134,71 @@ def get_dataloader(csv_path, batch_size=16, tokenizer=None, max_len=32, tokenize
         dataset = STSDataset(df, tokenizer, max_len)
 
     return DataLoader(dataset, batch_size=batch_size, shuffle=True), tokenizer
+
+
+class PretrainedSTSDataset(Dataset):
+    """预训练模型数据集：预先批量编码，__getitem__ 直接返回纯张量 (无序列化问题)"""
+    def __init__(self, ids1, masks1, ids2, masks2, labels):
+        # 所有数据均为预编码的 Tensor
+        self.ids1 = ids1
+        self.masks1 = masks1
+        self.ids2 = ids2
+        self.masks2 = masks2
+        self.labels = labels
+    
+    def __len__(self):
+        return len(self.labels)
+    
+    def __getitem__(self, idx):
+        return (
+            self.ids1[idx],
+            self.masks1[idx],
+            self.ids2[idx],
+            self.masks2[idx],
+            self.labels[idx]
+        )
+
+
+def get_pretrained_dataloader(csv_path, tokenizer, batch_size=32, max_len=128):
+    """为预训练模型创建 DataLoader (预先批量编码 + 离线缓存)
+    
+    关键优化：一次性对全量文本进行批量 tokenize，而非逐条调用。
+    """
+    cache_dir = "data/cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    file_stat = os.stat(csv_path)
+    hash_str = f"{csv_path}_{file_stat.st_mtime}_pretrained_{max_len}"
+    cache_key = hashlib.md5(hash_str.encode()).hexdigest()
+    dataset_cache_path = os.path.join(cache_dir, f"dataset_pt_{cache_key}.pkl")
+    
+    if os.path.exists(dataset_cache_path):
+        print(f"[缓存] 命中预训练数据缓存: {cache_key}，极速加载中...")
+        with open(dataset_cache_path, "rb") as f:
+            dataset = pickle.load(f)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    print(f"[处理] 预训练数据首次编码 {csv_path} (请耐心等待)...")
+    df = pd.read_csv(csv_path)
+    
+    s1_list = df['sentence1'].astype(str).tolist()
+    s2_list = df['sentence2'].astype(str).tolist()
+    labels = torch.tensor(df['label'].values, dtype=torch.float32)
+    
+    # 批量编码 (比逐条调用快几十倍)
+    enc1 = tokenizer(s1_list, max_length=max_len, padding='max_length', truncation=True, return_tensors='pt')
+    enc2 = tokenizer(s2_list, max_length=max_len, padding='max_length', truncation=True, return_tensors='pt')
+    
+    dataset = PretrainedSTSDataset(
+        enc1['input_ids'], enc1['attention_mask'],
+        enc2['input_ids'], enc2['attention_mask'],
+        labels
+    )
+    
+    # 落盘缓存 (纯 Tensor，无 tokenizer 对象，序列化无问题)
+    with open(dataset_cache_path, "wb") as f:
+        pickle.dump(dataset, f)
+    print(f"[成功] 预训练数据缓存写入完成: {cache_key}")
+    
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+

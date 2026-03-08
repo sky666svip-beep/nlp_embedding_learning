@@ -2,16 +2,9 @@ import pickle
 
 # 替换为你的.pkl文件路径
 pkl_path = "output/tokenizer.pkl"
-
-# 读取pkl文件中的分词器对象
 with open(pkl_path, 'rb') as f:
     tokenizer = pickle.load(f)
-
-# 打印对象类型（确认是分词器）
 print("对象类型：", type(tokenizer))
-
-# 核心：查看分词器的关键属性（根据NLP分词器的通用属性适配）
-# 先尝试打印最常见的核心属性，覆盖90%的SimpleCharTokenizer场景
 try:
     # 1. 词表（字符到ID的映射，核心！）
     if hasattr(tokenizer, 'vocab'):

@@ -81,7 +81,6 @@ if "loss_history" not in st.session_state:
     st.session_state.loss_history = []
 if "acc_history" not in st.session_state:
     st.session_state.acc_history = []
-# 用一个随机数或时间戳作为缓存失效的 key（当新训练完成时强制刷新缓存）
 if "train_version" not in st.session_state:
     st.session_state.train_version = 0
 
@@ -113,11 +112,9 @@ if start_train:
         
         engine = DualEncoderEngine(selected_model_type, embed_dim=embed_dim)
         
-        # 展示预训练模型的可训练参数信息
         if is_pretrained:
             st.info("正在加载 RoBERTa-wwm-ext 预训练权重 (首次运行会自动下载约400MB)...")
         
-        # 获取 DataLoader (预训练模型的全量集由于预先 Tokenize 可能耗时较长)
         with st.spinner("正在加载与预处理数据集 (全量集首次 Tokenize 可能需要2-3分钟，建立缓存后将极速加载)..."):
             if is_pretrained:
                 from data import get_pretrained_dataloader
@@ -133,7 +130,6 @@ if start_train:
             st.session_state.acc_history.append(batch_acc)
             current_step = epoch * total_batches + batch_idx + 1
             progress_bar.progress(current_step / total_steps)
-            # 仅在每个 epoch 结束时更新状态文本
             if batch_idx == total_batches - 1:
                 status_text.text(f"Epoch {epoch+1}/{epochs} 完成 | 平均Loss: {loss:.4f} | 末尾Acc: {batch_acc:.4f}")
             
@@ -142,8 +138,7 @@ if start_train:
             st.session_state.model_state = engine.model.state_dict()
             st.session_state.tokenizer = engine.tokenizer
             st.session_state.model_type = selected_model_type
-            
-        # 训练结束后一次性渲染最终曲线
+
         col_c1, col_c2 = st.columns(2)
         with col_c1:
             st.write("[Loss 曲线]")
@@ -247,14 +242,12 @@ with tab2:
     if st.session_state.model_state:
         engine = get_loaded_engine()
         df = pd.read_csv(selected_dataset_path)
-        # 提取前 30 对句子用于展示
         sentences = list(set(df['sentence1'].tolist()[:30] + df['sentence2'].tolist()[:30]))
         
         with st.spinner("抽取高维特征并计算 PCA..."):
             coords = get_pca_data(st.session_state.train_version, engine, sentences)
             chart_df = pd.DataFrame({"X": coords[:, 0], "Y": coords[:, 1], "Text": sentences})
-            
-            # Use columns to lay out side-by-side
+
             c1, c2 = st.columns([2, 1])
             with c1:
                 st.scatter_chart(chart_df, x="X", y="Y")
@@ -304,35 +297,93 @@ with tab4:
             engine = get_loaded_engine()
             df = pd.read_csv(selected_dataset_path)
             
-            with st.spinner("1/3 正在提取唯一句子字典 (过滤重复语句)..."):
-                # 为了防止两两配对数据里大量重复句子占用显存，首先去重
-                s1_unique = df[['sentence1', 'label']].rename(columns={'sentence1': 'text'})
-                s2_unique = df[['sentence2', 'label']].rename(columns={'sentence2': 'text'})
-                # 由于相同的句子如果在原表中遇到过正样本又遇到负样本，保留第一次出现的，仅作为检索结果参考
-                unique_df = pd.concat([s1_unique, s2_unique]).drop_duplicates(subset=['text'], keep='first').reset_index(drop=True)
-                sentences = unique_df['text'].tolist()
-                labels = unique_df['label'].tolist()
-            
-            with st.spinner(f"2/3 正在使用 GPU 将 {len(sentences)} 条语句编码为高维特征 (可能耗时数十秒)..."):
-                np_embeddings = engine.encode(sentences, batch_size=256)
-                norms = np.linalg.norm(np_embeddings, axis=1, keepdims=True)
-                np_embeddings = np_embeddings / np.clip(norms, 1e-9, None)
-                full_tensor = torch.tensor(np_embeddings).to(engine.device)
-                
-            with st.spinner("3/3 正在构建 FAISS 倒排索引..."):
-                np_embeddings_f32 = np_embeddings.astype('float32')
-                # 使用内积 (Inner Product) 索引评估，因为标准化后内积 == 余弦相似度
-                faiss_index = faiss.IndexFlatIP(embed_dim) 
-                faiss_index.add(np_embeddings_f32)
+            dataset_basename = os.path.basename(selected_dataset_path).replace('.csv', '')
+            npy_path = f"output/doc_cache_{selected_model_type}_{dataset_basename}_embed{embed_dim}.npy"
+            pkl_path = f"output/doc_meta_{selected_model_type}_{dataset_basename}_embed{embed_dim}.pkl"
 
-            # 保存到 session
-            st.session_state.vector_db = {
-                "tensor": full_tensor, 
-                "faiss": faiss_index,             
-                "texts": sentences,
-                "labels": labels
-            }
-            st.success(f"成功构建向量库！一共编入 {len(sentences)} 根不重复向量。")
+            if os.path.exists(npy_path) and os.path.exists(pkl_path):
+                with st.spinner("正在检测本地缓存..."):
+                    import time
+                    time.sleep(0.5)  # 稍微展示一下UI提示，让体验更自然
+                    
+                    np_embeddings = np.load(npy_path)
+                    with open(pkl_path, "rb") as f:
+                        meta_data = pickle.load(f)
+                    
+                    sentences = meta_data["sentences"]
+                    labels = meta_data["labels"]
+                    
+                    # 取出原始嵌入重新规范化与转Device
+                    norms = np.linalg.norm(np_embeddings, axis=1, keepdims=True)
+                    np_embeddings = np_embeddings / np.clip(norms, 1e-9, None)
+                    full_tensor = torch.tensor(np_embeddings).to(engine.device)
+                    
+                    np_embeddings_f32 = np_embeddings.astype('float32')
+                    
+                    #  FAISS 百万级进阶：从暴力穷举 (Flat) 升级至 倒排索引 (IVF)
+                    # 1. 建立基础量化器 (依然使用内积 IP 衡量余弦距离)
+                    quantizer = faiss.IndexFlatIP(embed_dim)
+                    # 2. 动态决定聚类中心桶的数量 (nlist)
+                    # 经验法则: nlist = 4 * sqrt(N)
+                    nlist = max(50, int(4 * np.sqrt(len(np_embeddings_f32))))
+                    faiss_index = faiss.IndexIVFFlat(quantizer, embed_dim, nlist, faiss.METRIC_INNER_PRODUCT)
+                    
+                    # 3. 必须先使用数据训练聚类中心，然后再把数据添加进去
+                    faiss_index.train(np_embeddings_f32)
+                    faiss_index.add(np_embeddings_f32)
+                    
+                    # 查询时搜索的桶数量 (nprobe), nprobe 越大越准, 但也越慢, 默认是 1
+                    faiss_index.nprobe = min(nlist, max(5, int(nlist * 0.1)))
+                    
+                st.session_state.vector_db = {
+                    "tensor": full_tensor, 
+                    "faiss": faiss_index,             
+                    "texts": sentences,
+                    "labels": labels
+                }
+                st.success(f"⚡ 已从本地缓存极速恢复！一共有 {len(sentences)} 根不重复向量。 [已开启倒排索引聚类加速(nlist={faiss_index.nlist}, nprobe={faiss_index.nprobe})]")
+            else:
+                with st.spinner("1/3 正在提取唯一句子字典 (过滤重复语句)..."):
+                    # 为了防止两两配对数据里大量重复句子占用显存，首先去重
+                    s1_unique = df[['sentence1', 'label']].rename(columns={'sentence1': 'text'})
+                    s2_unique = df[['sentence2', 'label']].rename(columns={'sentence2': 'text'})
+                    # 由于相同的句子如果在原表中遇到过正样本又遇到负样本，保留第一次出现的，仅作为检索结果参考
+                    unique_df = pd.concat([s1_unique, s2_unique]).drop_duplicates(subset=['text'], keep='first').reset_index(drop=True)
+                    sentences = unique_df['text'].tolist()
+                    labels = unique_df['label'].tolist()
+                
+                with st.spinner(f"2/3 正在使用 GPU 将 {len(sentences)} 条语句编码为高维特征 (可能耗时数十秒)..."):
+                    np_embeddings = engine.encode(sentences, batch_size=256)
+                    
+                    #  新增本地向量缓存落地逻辑
+                    os.makedirs("output", exist_ok=True)
+                    np.save(npy_path, np_embeddings)
+                    with open(pkl_path, "wb") as f:
+                        pickle.dump({"sentences": sentences, "labels": labels}, f)
+                    
+                    norms = np.linalg.norm(np_embeddings, axis=1, keepdims=True)
+                    np_embeddings = np_embeddings / np.clip(norms, 1e-9, None)
+                    full_tensor = torch.tensor(np_embeddings).to(engine.device)
+                    
+                with st.spinner("3/3 正在训练并构建 FAISS 倒排索引 (IVFFlat)..."):
+                    np_embeddings_f32 = np_embeddings.astype('float32')
+                    
+                    #  FAISS 百万级进阶：从暴力穷举 (Flat) 升级至 倒排索引 (IVF)
+                    quantizer = faiss.IndexFlatIP(embed_dim)
+                    nlist = max(50, int(4 * np.sqrt(len(np_embeddings_f32))))
+                    faiss_index = faiss.IndexIVFFlat(quantizer, embed_dim, nlist, faiss.METRIC_INNER_PRODUCT)
+                    
+                    faiss_index.train(np_embeddings_f32)
+                    faiss_index.add(np_embeddings_f32)
+                    faiss_index.nprobe = min(nlist, max(5, int(nlist * 0.1)))
+
+                st.session_state.vector_db = {
+                    "tensor": full_tensor, 
+                    "faiss": faiss_index,             
+                    "texts": sentences,
+                    "labels": labels
+                }
+                st.success(f"成功构建并缓存了向量库！一共编入 {len(sentences)} 根不重复向量。[已开启倒排索引聚类加速(nlist={faiss_index.nlist}, nprobe={faiss_index.nprobe})]")
 
     if st.session_state.vector_db:
         st.divider()

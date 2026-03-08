@@ -96,6 +96,27 @@ def get_dataloader(csv_path, batch_size=16, tokenizer=None, max_len=32, tokenize
     dataset_cache_path = os.path.join(cache_dir, f"dataset_{cache_key}.pkl")
     tokenizer_cache_path = os.path.join(cache_dir, f"tokenizer_{cache_key}.pkl")
     
+    # DataLoader 性能优化：启用锁页内存和多进程预取加速 CUDA 传输
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": True,
+        # 锁页内存：直接映射到 GPU 显存 DMA, 大幅加快 HostToDevice 速度
+        "pin_memory": torch.cuda.is_available() or torch.backends.mps.is_available()
+    }
+    
+    # Windows 环境下多进程可能导致序列化 Bug，建议保守设置或确保按 spawn 启动。
+    # 这里开启 2 个进程 (不要太多避免上下文切换开销)，并设置预取量
+    if os.name != 'nt':  # Linux/Mac 可以大胆开多进程
+        loader_kwargs.update({
+            "num_workers": 4,
+            "prefetch_factor": 2, 
+            "persistent_workers": True
+        })
+    else: # Windows 限制进程数为 0 或 2 (若环境健壮)
+        loader_kwargs.update({
+            "num_workers": 0 
+        })
+
     if not tokenizer:
         if os.path.exists(dataset_cache_path) and os.path.exists(tokenizer_cache_path):
             print(f"[缓存] 命中本地缓存: {cache_key}，正在极速加载序列化数据集...")
@@ -103,7 +124,7 @@ def get_dataloader(csv_path, batch_size=16, tokenizer=None, max_len=32, tokenize
                 tokenizer = pickle.load(f)
             with open(dataset_cache_path, "rb") as f:
                 dataset = pickle.load(f)
-            return DataLoader(dataset, batch_size=batch_size, shuffle=True), tokenizer
+            return DataLoader(dataset, **loader_kwargs), tokenizer
 
         print(f"[处理] 未命中本地缓存: 正在全量分词与张量化 {csv_path} (请耐心等待)...")
         df = pd.read_csv(csv_path)
@@ -133,7 +154,7 @@ def get_dataloader(csv_path, batch_size=16, tokenizer=None, max_len=32, tokenize
         df = pd.read_csv(csv_path)
         dataset = STSDataset(df, tokenizer, max_len)
 
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True), tokenizer
+    return DataLoader(dataset, **loader_kwargs), tokenizer
 
 
 class PretrainedSTSDataset(Dataset):
@@ -172,12 +193,29 @@ def get_pretrained_dataloader(csv_path, tokenizer, batch_size=32, max_len=128):
     cache_key = hashlib.md5(hash_str.encode()).hexdigest()
     dataset_cache_path = os.path.join(cache_dir, f"dataset_pt_{cache_key}.pkl")
     
+    # 为预训练模型应用更极端的 DataLoader 性能优化 
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": True,
+        "pin_memory": torch.cuda.is_available() or torch.backends.mps.is_available()
+    }
+    
+    if os.name != 'nt':  # Linux/Mac
+        loader_kwargs.update({
+            "num_workers": 4,
+            "prefetch_factor": 2, 
+            "persistent_workers": True
+        })
+    else:
+        loader_kwargs.update({
+            "num_workers": 0 
+        })
+
     if os.path.exists(dataset_cache_path):
         print(f"[缓存] 命中预训练数据缓存: {cache_key}，极速加载中...")
         with open(dataset_cache_path, "rb") as f:
             dataset = pickle.load(f)
-        return DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                         pin_memory=True, num_workers=2, persistent_workers=True)
+        return DataLoader(dataset, **loader_kwargs)
     
     print(f"[处理] 预训练数据首次编码 {csv_path} (请耐心等待)...")
     df = pd.read_csv(csv_path)
@@ -201,6 +239,5 @@ def get_pretrained_dataloader(csv_path, tokenizer, batch_size=32, max_len=128):
         pickle.dump(dataset, f)
     print(f"[成功] 预训练数据缓存写入完成: {cache_key}")
     
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                     pin_memory=True, num_workers=2, persistent_workers=True)
+    return DataLoader(dataset, **loader_kwargs)
 

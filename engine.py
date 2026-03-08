@@ -114,7 +114,7 @@ class DualEncoderEngine:
         return self
     
     def _train_pretrained(self, data_path, epochs, batch_size, lr, callback):
-        """预训练模型微调流程 (RoBERTa) — 支持 AMP 混合精度加速"""
+        """预训练模型微调流程 (RoBERTa) — 支持 AMP 混合精度加速 + Warmup + Cosine LR + Early Stopping"""
         dataloader = get_pretrained_dataloader(data_path, self.tokenizer, batch_size=batch_size)
         
         # 直接复用 __init__ 中已创建的模型，无需重复实例化
@@ -124,14 +124,30 @@ class DualEncoderEngine:
         optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.01)
         criterion = nn.MSELoss()
         
+        # --- 学习率调度器 (Warmup + Cosine Annealing) ---
+        total_batches = len(dataloader)
+        total_steps = epochs * total_batches
+        warmup_steps = int(total_steps * 0.1) # 前 10% 的步数用于 Warmup
+        
+        # 1. 线性 Warmup 预热 (从 1e-6 启动，倍率逐步提升到 1.0)
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+        # 2. 余弦退火规律衰减到最小 lr
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=(total_steps - warmup_steps), eta_min=1e-6)
+        # 3. 串联
+        scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
+        
         # AMP 混合精度：仅 CUDA 环境启用 (MPS/CPU 不支持)
         use_amp = (self.device.type == 'cuda')
         scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
         
-        total_batches = len(dataloader)
         tag = "LoRA" if self.model_type == "lora" else "Pretrained"
         if use_amp:
             print(f"[{tag}] AMP 混合精度已启用 (FP16 加速)")
+            
+        # --- 早停 (Early Stopping) 机制 ---
+        best_loss = float('inf')
+        patience = 2
+        patience_counter = 0
         
         for epoch in range(epochs):
             self.model.train()
@@ -159,6 +175,8 @@ class DualEncoderEngine:
                 scaler.step(optimizer)
                 scaler.update()
                 
+                scheduler.step() # 每走一步 (Batch) 调度一次学习率
+                
                 correct = ((sim > 0) == (target_sim > 0)).float().sum()
                 batch_acc = (correct / label.size(0)).item()
                 
@@ -168,7 +186,20 @@ class DualEncoderEngine:
                     callback(epoch, batch_idx, loss.item(), batch_acc)
             
             avg_loss = total_loss / total_batches
-            print(f"[{tag}] Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+            print(f"[{tag}] Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.2e}")
+            
+            # 检查 Early Stopping
+            if avg_loss < best_loss - 1e-4:
+                best_loss = avg_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"[{tag}] Early Stopping Triggered! 连续 {patience} 轮 Loss 无明显下降。")
+                    if callback:  # 让前端页面表现为快速结束
+                        # Simulate jumping to the end for the progress bar
+                        callback(epochs-1, total_batches-1, loss.item(), batch_acc)
+                    break 
         
         return self
 

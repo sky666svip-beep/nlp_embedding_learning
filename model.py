@@ -4,8 +4,6 @@ os.environ["DISABLE_SAFETENSORS_CONVERSION"] = "1"
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
 def _load_roberta(model_name):
     """加载 RoBERTa 底座：本地缓存优先，无网络请求则不触发 403"""
     from transformers import AutoModel
